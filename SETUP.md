@@ -74,9 +74,11 @@ FishTracker/
 - Copiază conținutul din `supabase/schema.sql`
 - Click "Run"
 
-## Pas 6: Configureaza resetarea parolei prin cod
+Schema actualizata creeaza si bucketurile publice `photos` si `avatars`. Daca ai rulat o versiune mai veche a fisierului, ruleaza din nou schema curenta ca sa adaugi politicile storage pentru upload si afisare imagini.
 
-Fluxul de resetare nu mai depinde de linkul standard Supabase. Aplicatia foloseste doua Edge Functions care trimit un cod pe email si schimba parola direct in app.
+## Pas 6: Configureaza emailurile tranzactionale prin cod
+
+Fluxul de resetare a parolei si confirmarea contului nu mai depind de linkurile standard Supabase. Aplicatia foloseste Edge Functions care trimit coduri pe email si confirma actiunile direct in app.
 
 ### 6.1 Instaleaza Supabase CLI
 
@@ -112,11 +114,18 @@ supabase secrets set APP_NAME="FishTracker"
 ### 6.5 Deploy pentru functii
 
 ```bash
+supabase functions deploy request-sign-up
+supabase functions deploy confirm-sign-up
 supabase functions deploy request-password-reset
 supabase functions deploy confirm-password-reset
 ```
 
 ### 6.6 Testare rapida
+
+- Deschide ecranul de inregistrare
+- Creeaza un cont nou
+- Verifica email-ul primit prin Resend
+- Introdu codul direct in aplicatie pentru confirmarea contului
 
 - Deschide ecranul de login
 - Apasa pe `Ai uitat parola?`

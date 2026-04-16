@@ -9,23 +9,29 @@ import {
   clearActiveSession,
   saveRodCastTime,
   loadRodCastTime,
+  clearRodCastTime,
   addPendingCatch,
   loadPendingCatches,
   removePendingCatch,
+  removePendingCatchesForRod,
   type PendingCatch,
 } from '../lib/storage';
-import type { LocalSessionState, LocalRodState, WeatherSnapshot } from '../types';
+import type { LocalSessionState, LocalRodState, RodNumber, WeatherSnapshot } from '../types';
 
-const DEFAULT_RODS = (): LocalRodState[] =>
-  ([1, 2, 3, 4] as const).map((n) => ({
-    rodNumber: n,
-    baitName: '',
-    hookSetup: '',
-    castCount: 0,
-    lastCastTimestamp: null,
-    catchCount: 0,
-    rodId: null,
-  }));
+const ALL_ROD_NUMBERS: RodNumber[] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+const buildRodState = (rodNumber: RodNumber): LocalRodState => ({
+  rodNumber,
+  baitName: '',
+  hookSetup: '',
+  castCount: 0,
+  lastCastTimestamp: null,
+  catchCount: 0,
+  rodId: null,
+});
+
+const DEFAULT_RODS = (count = 1): LocalRodState[] =>
+  ALL_ROD_NUMBERS.slice(0, Math.max(1, Math.min(10, count))).map((n) => buildRodState(n));
 
 interface SessionStoreState {
   activeSession: LocalSessionState | null;
@@ -40,6 +46,8 @@ interface SessionStoreState {
   updateSessionLocation: (locationId: string | null, locationName: string) => Promise<void>;
 
   // Lansete
+  addRod: () => number | null;
+  removeRod: (rodNumber: number) => Promise<boolean>;
   castRod: (rodNumber: number) => void;
   updateRod: (rodNumber: number, updates: Partial<LocalRodState>) => void;
   saveRodSetup: (rodNumber: number, updates: Partial<LocalRodState>, userId?: string) => Promise<void>;
@@ -128,6 +136,61 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
         return { activeSession: synced };
       });
     }
+  },
+
+  addRod: () => {
+    const { activeSession } = get();
+    if (!activeSession) return null;
+
+    const nextRodNumber = ALL_ROD_NUMBERS.find((rodNumber) =>
+      !activeSession.rods.some((rod) => rod.rodNumber === rodNumber)
+    );
+
+    if (!nextRodNumber) return null;
+
+    const updatedSession = {
+      ...activeSession,
+      rods: [...activeSession.rods, buildRodState(nextRodNumber)],
+      isSynced: false,
+    };
+
+    set({ activeSession: updatedSession });
+    void saveActiveSession(updatedSession);
+    return nextRodNumber;
+  },
+
+  removeRod: async (rodNumber) => {
+    const { activeSession } = get();
+    if (!activeSession || activeSession.rods.length <= 1) return false;
+
+    const rodToRemove = activeSession.rods.find((rod) => rod.rodNumber === rodNumber);
+    if (!rodToRemove) return false;
+
+    const updatedSession = {
+      ...activeSession,
+      rods: activeSession.rods.filter((rod) => rod.rodNumber !== rodNumber),
+      isSynced: false,
+    };
+
+    set({ activeSession: updatedSession });
+    await clearRodCastTime(rodNumber);
+    await removePendingCatchesForRod(activeSession.sessionId, rodNumber);
+    void saveActiveSession(updatedSession);
+
+    if (rodToRemove.rodId) {
+      const { error } = await supabase
+        .from('rods')
+        .delete()
+        .eq('id', rodToRemove.rodId);
+
+      if (error) {
+        set({ activeSession });
+        void saveActiveSession(activeSession);
+        return false;
+      }
+    }
+
+    return true;
   },
 
   castRod: (rodNumber) => {

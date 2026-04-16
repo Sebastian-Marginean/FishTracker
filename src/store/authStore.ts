@@ -8,6 +8,54 @@ import { AUTH_REDIRECT_URL } from '../lib/authRedirect';
 import { supabase } from '../lib/supabase';
 import type { Profile } from '../types';
 
+type AccessBlock = {
+  kind: 'ban';
+  until?: string | null;
+  permanent?: boolean;
+};
+
+let profileStatusChannel: any = null;
+
+function isProfileBanned(profile?: Pick<Profile, 'banned_until' | 'ban_permanent'> | null) {
+  if (!profile) return false;
+  return !!profile.ban_permanent || (!!profile.banned_until && new Date(profile.banned_until).getTime() > Date.now());
+}
+
+function getAccessBlockFromProfile(profile: Pick<Profile, 'banned_until' | 'ban_permanent'>): AccessBlock {
+  return {
+    kind: 'ban',
+    until: profile.banned_until ?? null,
+    permanent: !!profile.ban_permanent,
+  };
+}
+
+async function fetchProfileByUserId(userId: string): Promise<Profile | null> {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', userId)
+    .single();
+
+  if (error || !data) return null;
+  return data as Profile;
+}
+
+async function syncProfileStatusChannel(userId: string | null, onProfileChange: () => void) {
+  if (profileStatusChannel) {
+    await supabase.removeChannel(profileStatusChannel);
+    profileStatusChannel = null;
+  }
+
+  if (!userId) return;
+
+  profileStatusChannel = supabase
+    .channel(`profile-access-${userId}`)
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'profiles', filter: `id=eq.${userId}` }, () => {
+      onProfileChange();
+    })
+    .subscribe();
+}
+
 async function normalizeFunctionInvokeError(error: unknown): Promise<string | null> {
   if (!error) return null;
 
@@ -52,6 +100,7 @@ interface AuthState {
   user: User | null;
   profile: Profile | null;
   session: Session | null;
+  accessBlock: AccessBlock | null;
   isLoading: boolean;
   isInitialized: boolean;
 
@@ -59,19 +108,23 @@ interface AuthState {
   initialize: () => Promise<void>;
   signIn: (email: string, password: string) => Promise<{ error: string | null }>;
   signUp: (email: string, password: string, username: string) => Promise<{ error: string | null }>;
+  confirmSignUp: (email: string, code: string) => Promise<{ error: string | null }>;
   resetPassword: (email: string) => Promise<{ error: string | null }>;
   confirmPasswordReset: (email: string, code: string, password: string) => Promise<{ error: string | null }>;
   updateEmail: (email: string) => Promise<{ error: string | null }>;
   updatePassword: (password: string) => Promise<{ error: string | null }>;
   signOut: () => Promise<void>;
   updateProfile: (updates: Partial<Profile>) => Promise<{ error: string | null }>;
-  fetchProfile: () => Promise<void>;
+  fetchProfile: () => Promise<Profile | null>;
+  refreshSessionAccess: (sessionOverride?: Session | null) => Promise<void>;
+  clearAccessBlock: () => void;
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({
   user: null,
   profile: null,
   session: null,
+  accessBlock: null,
   isLoading: false,
   isInitialized: false,
 
@@ -108,17 +161,16 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     const { data: { session } } = await supabase.auth.getSession();
 
     if (session?.user) {
-      set({ user: session.user, session });
-      await get().fetchProfile();
+      await get().refreshSessionAccess(session);
     }
 
     // Ascultă schimbările de auth în timp real
     supabase.auth.onAuthStateChange(async (_event, session) => {
-      set({ user: session?.user ?? null, session });
       if (session?.user) {
-        await get().fetchProfile();
+        await get().refreshSessionAccess(session);
       } else {
-        set({ profile: null });
+        await syncProfileStatusChannel(null, () => undefined);
+        set((state) => ({ user: null, profile: null, session: null, accessBlock: state.accessBlock }));
       }
     });
 
@@ -130,38 +182,33 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   signIn: async (email, password) => {
-    set({ isLoading: true });
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    set({ isLoading: true, accessBlock: null });
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (!error && data.session?.user) {
+      await get().refreshSessionAccess(data.session);
+    }
     set({ isLoading: false });
     return { error: error?.message ?? null };
   },
 
   signUp: async (email, password, username) => {
     set({ isLoading: true });
-
-    // Verifică dacă username-ul e disponibil
-    const { data: existing } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('username', username)
-      .single();
-
-    if (existing) {
-      set({ isLoading: false });
-      return { error: 'Username-ul este deja folosit' };
-    }
-
-    const { error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: { username, full_name: username },
-        emailRedirectTo: AUTH_REDIRECT_URL,
-      },
+    const { error } = await supabase.functions.invoke('request-sign-up', {
+      body: { email, password, username },
     });
-
+    const normalizedError = await normalizeFunctionInvokeError(error);
     set({ isLoading: false });
-    return { error: error?.message ?? null };
+    return { error: normalizedError };
+  },
+
+  confirmSignUp: async (email, code) => {
+    set({ isLoading: true });
+    const { error } = await supabase.functions.invoke('confirm-sign-up', {
+      body: { email, code },
+    });
+    const normalizedError = await normalizeFunctionInvokeError(error);
+    set({ isLoading: false });
+    return { error: normalizedError };
   },
 
   resetPassword: async (email) => {
@@ -199,23 +246,61 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   signOut: async () => {
+    await syncProfileStatusChannel(null, () => undefined);
     await supabase.auth.signOut();
-    set({ user: null, profile: null, session: null });
+    set((state) => ({ user: null, profile: null, session: null, accessBlock: state.accessBlock }));
   },
 
   fetchProfile: async () => {
     const { user } = get();
-    if (!user) return;
+    if (!user) return null;
 
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', user.id)
-      .single();
+    const profile = await fetchProfileByUserId(user.id);
+    if (!profile) return null;
 
-    if (!error && data) {
-      set({ profile: data as Profile });
+    if (isProfileBanned(profile)) {
+      const accessBlock = getAccessBlockFromProfile(profile);
+      set({ accessBlock, user: null, profile: null, session: null });
+      await syncProfileStatusChannel(null, () => undefined);
+      await supabase.auth.signOut();
+      return null;
     }
+
+    set({ profile, accessBlock: null });
+    return profile;
+  },
+
+  refreshSessionAccess: async (sessionOverride) => {
+    const activeSession = sessionOverride ?? get().session;
+    if (!activeSession?.user) {
+      await syncProfileStatusChannel(null, () => undefined);
+      set((state) => ({ user: null, profile: null, session: null, accessBlock: state.accessBlock }));
+      return;
+    }
+
+    const profile = await fetchProfileByUserId(activeSession.user.id);
+    if (profile && isProfileBanned(profile)) {
+      const accessBlock = getAccessBlockFromProfile(profile);
+      set({ accessBlock, user: null, profile: null, session: null });
+      await syncProfileStatusChannel(null, () => undefined);
+      await supabase.auth.signOut();
+      return;
+    }
+
+    await syncProfileStatusChannel(activeSession.user.id, () => {
+      void get().fetchProfile();
+    });
+
+    set({
+      user: activeSession.user,
+      session: activeSession,
+      profile,
+      accessBlock: null,
+    });
+  },
+
+  clearAccessBlock: () => {
+    set({ accessBlock: null });
   },
 
   updateProfile: async (updates) => {

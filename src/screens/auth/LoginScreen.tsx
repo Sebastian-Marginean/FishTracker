@@ -4,16 +4,23 @@ import React, { useEffect, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity,
   StyleSheet, KeyboardAvoidingView, Platform,
-  ScrollView, Alert, ActivityIndicator,
+  ScrollView, ActivityIndicator,
   ImageBackground,
   Modal,
 } from 'react-native';
+import PasswordStrengthMeter from '../../components/PasswordStrengthMeter';
 import SuccessSheet from '../../components/SuccessSheet';
 import { useAuthStore } from '../../store/authStore';
-import { useI18n } from '../../i18n';
+import { formatDateTime, useI18n } from '../../i18n';
 import { useLanguageStore } from '../../store/languageStore';
 
 interface SuccessState {
+  title: string;
+  message: string;
+  details?: string;
+}
+
+interface NoticeState {
   title: string;
   message: string;
   details?: string;
@@ -23,19 +30,23 @@ type ResetStep = 'request' | 'confirm';
 
 const EMAIL_ACTION_COOLDOWN_MS = 60_000;
 
+function isRateLimitMessage(message: string) {
+  return /email rate limit exceeded|too many requests/i.test(message);
+}
+
+function isInvalidCodeMessage(message: string) {
+  return /cod invalid|invalid or expired/i.test(message);
+}
+
 function getFriendlyAuthMessage(
   message: string,
   t: (key: string, params?: Record<string, string | number>) => string,
 ) {
-  if (/email rate limit exceeded/i.test(message)) {
+  if (isRateLimitMessage(message)) {
     return t('auth.emailRateLimit');
   }
 
-  if (/too many requests/i.test(message)) {
-    return t('auth.emailRateLimit');
-  }
-
-  if (/cod invalid|invalid or expired/i.test(message)) {
+  if (isInvalidCodeMessage(message)) {
     return t('auth.resetCodeInvalid');
   }
 
@@ -43,20 +54,55 @@ function getFriendlyAuthMessage(
 }
 
 export default function LoginScreen({ navigation }: any) {
-  const { signIn, resetPassword, confirmPasswordReset, isLoading } = useAuthStore();
+  const { signIn, resetPassword, confirmPasswordReset, isLoading, accessBlock, clearAccessBlock } = useAuthStore();
   const { language, t } = useI18n();
   const setLanguage = useLanguageStore((state) => state.setLanguage);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [resetModalVisible, setResetModalVisible] = useState(false);
   const [resetEmail, setResetEmail] = useState('');
   const [resetCode, setResetCode] = useState('');
   const [resetNewPassword, setResetNewPassword] = useState('');
   const [resetConfirmPassword, setResetConfirmPassword] = useState('');
+  const [showResetNewPassword, setShowResetNewPassword] = useState(false);
+  const [showResetConfirmPassword, setShowResetConfirmPassword] = useState(false);
   const [resetStep, setResetStep] = useState<ResetStep>('request');
   const [successState, setSuccessState] = useState<SuccessState | null>(null);
+  const [noticeState, setNoticeState] = useState<NoticeState | null>(null);
   const [resetCooldownUntil, setResetCooldownUntil] = useState<number | null>(null);
   const [resetCooldownLeft, setResetCooldownLeft] = useState(0);
+
+  const openWarningNotice = (title: string, message: string, details?: string) => {
+    setNoticeState({ title, message, details });
+  };
+
+  const openAuthErrorNotice = (title: string, message: string) => {
+    openWarningNotice(title, getFriendlyAuthMessage(message, t));
+  };
+
+  const openRateLimitNotice = (seconds: number) => {
+    openWarningNotice(t('auth.rateLimitTitle'), t('auth.rateLimitMessage'), t('auth.emailCooldown', { seconds }));
+  };
+
+  const openInvalidCodeNotice = () => {
+    openWarningNotice(t('auth.invalidCodeTitle'), t('auth.invalidCodeMessage'));
+  };
+
+  useEffect(() => {
+    if (!accessBlock || accessBlock.kind !== 'ban') return;
+
+    openWarningNotice(
+      t('auth.accountBannedTitle'),
+      t('auth.accountBannedMessage'),
+      accessBlock.permanent
+        ? t('auth.accountBannedPermanent')
+        : accessBlock.until
+          ? t('auth.accountBannedUntil', { date: formatDateTime(language, accessBlock.until) })
+          : undefined,
+    );
+    clearAccessBlock();
+  }, [accessBlock, clearAccessBlock, language, t]);
 
   useEffect(() => {
     if (!resetCooldownUntil) {
@@ -82,31 +128,33 @@ export default function LoginScreen({ navigation }: any) {
 
   const handleLogin = async () => {
     if (!email.trim() || !password.trim()) {
-      Alert.alert(t('common.error'), t('auth.fillLoginFields'));
+      openWarningNotice(t('auth.validationTitle'), t('auth.fillLoginFields'));
       return;
     }
     const { error } = await signIn(email.trim(), password);
-    if (error) Alert.alert(t('auth.loginFailed'), getFriendlyAuthMessage(error, t));
+    if (error) openAuthErrorNotice(t('auth.loginFailed'), error);
   };
 
   const handleResetPassword = async () => {
     if (!resetEmail.trim()) {
-      Alert.alert(t('common.error'), t('auth.emailRequired'));
+      openWarningNotice(t('auth.validationTitle'), t('auth.emailRequired'));
       return;
     }
 
     if (resetCooldownLeft > 0) {
-      Alert.alert(t('common.info'), t('auth.emailCooldown', { seconds: resetCooldownLeft }));
+      openRateLimitNotice(resetCooldownLeft);
       return;
     }
 
     const { error } = await resetPassword(resetEmail.trim());
     if (error) {
-      if (/email rate limit exceeded|too many requests/i.test(error)) {
+      if (isRateLimitMessage(error)) {
         setResetCooldownUntil(Date.now() + EMAIL_ACTION_COOLDOWN_MS);
+        openRateLimitNotice(60);
+        return;
       }
 
-      Alert.alert(t('common.error'), getFriendlyAuthMessage(error, t));
+      openAuthErrorNotice(t('common.error'), error);
       return;
     }
 
@@ -129,29 +177,34 @@ export default function LoginScreen({ navigation }: any) {
 
   const handleConfirmResetPassword = async () => {
     if (!resetEmail.trim()) {
-      Alert.alert(t('common.error'), t('auth.emailRequired'));
+      openWarningNotice(t('auth.validationTitle'), t('auth.emailRequired'));
       return;
     }
 
     if (!resetCode.trim()) {
-      Alert.alert(t('common.error'), t('auth.resetCodeRequired'));
+      openWarningNotice(t('auth.validationTitle'), t('auth.resetCodeRequired'));
       return;
     }
 
-    if (resetNewPassword.length < 6) {
-      Alert.alert(t('common.error'), t('auth.passwordTooShort'));
+    if (resetNewPassword.length < 8) {
+      openWarningNotice(t('auth.validationTitle'), t('auth.passwordTooShort'));
       return;
     }
 
     if (resetNewPassword !== resetConfirmPassword) {
-      Alert.alert(t('common.error'), t('auth.passwordMismatch'));
+      openWarningNotice(t('auth.validationTitle'), t('auth.passwordMismatch'));
       return;
     }
 
     const submittedEmail = resetEmail.trim();
     const { error } = await confirmPasswordReset(submittedEmail, resetCode.trim(), resetNewPassword);
     if (error) {
-      Alert.alert(t('common.error'), getFriendlyAuthMessage(error, t));
+      if (isInvalidCodeMessage(error)) {
+        openInvalidCodeNotice();
+        return;
+      }
+
+      openAuthErrorNotice(t('common.error'), error);
       return;
     }
 
@@ -222,14 +275,19 @@ export default function LoginScreen({ navigation }: any) {
             />
 
             <Text style={styles.label}>{t('auth.password')}</Text>
-            <TextInput
-              style={styles.input}
-              placeholder={t('auth.password')}
-              placeholderTextColor="#9AA6A0"
-              value={password}
-              onChangeText={setPassword}
-              secureTextEntry
-            />
+            <View style={styles.passwordInputWrap}>
+              <TextInput
+                style={[styles.input, styles.passwordInput]}
+                placeholder={t('auth.password')}
+                placeholderTextColor="#9AA6A0"
+                value={password}
+                onChangeText={setPassword}
+                secureTextEntry={!showPassword}
+              />
+              <TouchableOpacity style={styles.passwordToggle} onPress={() => setShowPassword((value) => !value)}>
+                <Text style={styles.passwordToggleText}>{showPassword ? t('common.hide') : t('common.show')}</Text>
+              </TouchableOpacity>
+            </View>
 
             <TouchableOpacity
               style={[styles.button, isLoading && styles.buttonDisabled]}
@@ -266,49 +324,92 @@ export default function LoginScreen({ navigation }: any) {
       <Modal visible={resetModalVisible} transparent animationType="slide" onRequestClose={closeResetModal}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>
-              {resetStep === 'request' ? t('auth.resetPasswordTitle') : t('auth.resetPasswordConfirmTitle')}
-            </Text>
-            <Text style={styles.modalSubtitle}>
-              {resetStep === 'request' ? t('auth.resetPasswordSubtitle') : t('auth.resetPasswordConfirmSubtitle')}
-            </Text>
-            <TextInput
-              style={styles.modalInput}
-              placeholder="email@example.com"
-              placeholderTextColor="#9AA6A0"
-              value={resetEmail}
-              onChangeText={setResetEmail}
-              keyboardType="email-address"
-              autoCapitalize="none"
-              autoComplete="email"
-            />
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeroRow}>
+              <View style={styles.modalHeroBadge}>
+                <Text style={styles.modalHeroIcon}>{resetStep === 'request' ? '📩' : '🔐'}</Text>
+              </View>
+              <View style={styles.modalHeroCopy}>
+                <Text style={styles.modalTitle}>
+                  {resetStep === 'request' ? t('auth.resetPasswordTitle') : t('auth.resetPasswordConfirmTitle')}
+                </Text>
+                <Text style={styles.modalSubtitle}>
+                  {resetStep === 'request' ? t('auth.resetPasswordSubtitle') : t('auth.resetPasswordConfirmSubtitle')}
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.modalInfoCard}>
+              <Text style={styles.modalInfoTitle}>
+                {resetStep === 'request' ? t('auth.resetPasswordInfoTitle') : t('auth.resetPasswordConfirmInfoTitle')}
+              </Text>
+              <Text style={styles.modalInfoText}>
+                {resetStep === 'request' ? t('auth.resetPasswordInfoBody') : t('auth.resetPasswordConfirmInfoBody')}
+              </Text>
+            </View>
+
+            <View style={styles.modalFieldGroup}>
+              <Text style={styles.modalFieldLabel}>{t('auth.resetPasswordEmailLabel')}</Text>
+              <TextInput
+                style={styles.modalInput}
+                placeholder="email@example.com"
+                placeholderTextColor="#9AA6A0"
+                value={resetEmail}
+                onChangeText={setResetEmail}
+                keyboardType="email-address"
+                autoCapitalize="none"
+                autoComplete="email"
+              />
+            </View>
             {resetStep === 'confirm' && (
               <>
-                <TextInput
-                  style={styles.modalInput}
-                  placeholder={t('auth.resetCodePlaceholder')}
-                  placeholderTextColor="#9AA6A0"
-                  value={resetCode}
-                  onChangeText={setResetCode}
-                  keyboardType="number-pad"
-                  autoCapitalize="none"
-                />
-                <TextInput
-                  style={styles.modalInput}
-                  placeholder={t('auth.newPassword')}
-                  placeholderTextColor="#9AA6A0"
-                  value={resetNewPassword}
-                  onChangeText={setResetNewPassword}
-                  secureTextEntry
-                />
-                <TextInput
-                  style={styles.modalInput}
-                  placeholder={t('auth.confirmPassword')}
-                  placeholderTextColor="#9AA6A0"
-                  value={resetConfirmPassword}
-                  onChangeText={setResetConfirmPassword}
-                  secureTextEntry
-                />
+                <View style={styles.modalFieldGroup}>
+                  <Text style={styles.modalFieldLabel}>{t('auth.resetPasswordConfirmTitle')}</Text>
+                  <TextInput
+                    style={[styles.modalInput, styles.modalCodeInput]}
+                    placeholder={t('auth.resetCodePlaceholder')}
+                    placeholderTextColor="#9AA6A0"
+                    value={resetCode}
+                    onChangeText={(value) => setResetCode(value.replace(/\D/g, '').slice(0, 6))}
+                    keyboardType="number-pad"
+                    autoCapitalize="none"
+                    maxLength={6}
+                    textAlign="center"
+                  />
+                </View>
+                <View style={styles.modalFieldGroup}>
+                  <Text style={styles.modalFieldLabel}>{t('auth.newPassword')}</Text>
+                  <View style={styles.passwordInputWrap}>
+                    <TextInput
+                      style={[styles.modalInput, styles.passwordInput]}
+                      placeholder={t('auth.newPassword')}
+                      placeholderTextColor="#9AA6A0"
+                      value={resetNewPassword}
+                      onChangeText={setResetNewPassword}
+                      secureTextEntry={!showResetNewPassword}
+                    />
+                    <TouchableOpacity style={styles.passwordToggle} onPress={() => setShowResetNewPassword((value) => !value)}>
+                      <Text style={styles.passwordToggleText}>{showResetNewPassword ? t('common.hide') : t('common.show')}</Text>
+                    </TouchableOpacity>
+                  </View>
+                  <PasswordStrengthMeter password={resetNewPassword} variant="auth" />
+                </View>
+                <View style={styles.modalFieldGroup}>
+                  <Text style={styles.modalFieldLabel}>{t('auth.confirmPassword')}</Text>
+                  <View style={styles.passwordInputWrap}>
+                    <TextInput
+                      style={[styles.modalInput, styles.passwordInput]}
+                      placeholder={t('auth.confirmPassword')}
+                      placeholderTextColor="#9AA6A0"
+                      value={resetConfirmPassword}
+                      onChangeText={setResetConfirmPassword}
+                      secureTextEntry={!showResetConfirmPassword}
+                    />
+                    <TouchableOpacity style={styles.passwordToggle} onPress={() => setShowResetConfirmPassword((value) => !value)}>
+                      <Text style={styles.passwordToggleText}>{showResetConfirmPassword ? t('common.hide') : t('common.show')}</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
               </>
             )}
             <View style={styles.modalActions}>
@@ -351,6 +452,18 @@ export default function LoginScreen({ navigation }: any) {
         message={successState?.message ?? ''}
         details={successState?.details}
         onClose={() => setSuccessState(null)}
+      />
+
+      <SuccessSheet
+        visible={!!noticeState}
+        title={noticeState?.title ?? ''}
+        message={noticeState?.message ?? ''}
+        details={noticeState?.details}
+        detailsLabel={t('auth.rateLimitDetailsLabel')}
+        buttonLabel={t('auth.ok')}
+        autoCloseMs={5000}
+        variant="warning"
+        onClose={() => setNoticeState(null)}
       />
     </KeyboardAvoidingView>
   );
@@ -473,6 +586,26 @@ const styles = StyleSheet.create({
     color: '#17352D',
     backgroundColor: '#FFFFFF',
   },
+  passwordInputWrap: {
+    position: 'relative',
+    justifyContent: 'center',
+  },
+  passwordInput: {
+    paddingRight: 84,
+  },
+  passwordToggle: {
+    position: 'absolute',
+    right: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: '#E8F5EF',
+  },
+  passwordToggleText: {
+    color: '#0F6E56',
+    fontSize: 12,
+    fontWeight: '800',
+  },
   button: {
     backgroundColor: '#1D9E75', borderRadius: 16, padding: 17,
     alignItems: 'center', marginTop: 22,
@@ -496,13 +629,76 @@ const styles = StyleSheet.create({
   },
   modalCard: {
     backgroundColor: '#F7FBF8',
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
+    borderTopLeftRadius: 30,
+    borderTopRightRadius: 30,
     padding: 24,
-    paddingBottom: 28,
+    paddingBottom: 30,
+    borderWidth: 1,
+    borderColor: '#D7E7DF',
+  },
+  modalHandle: {
+    width: 56,
+    height: 5,
+    borderRadius: 999,
+    backgroundColor: '#D0DED7',
+    alignSelf: 'center',
+    marginBottom: 18,
+  },
+  modalHeroRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+  },
+  modalHeroBadge: {
+    width: 56,
+    height: 56,
+    borderRadius: 18,
+    backgroundColor: '#DDF4E8',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalHeroIcon: {
+    fontSize: 24,
+  },
+  modalHeroCopy: {
+    flex: 1,
   },
   modalTitle: { fontSize: 22, fontWeight: '800', color: '#123A31' },
-  modalSubtitle: { fontSize: 14, lineHeight: 20, color: '#6A7E76', marginTop: 8, marginBottom: 16 },
+  modalSubtitle: { fontSize: 14, lineHeight: 20, color: '#6A7E76', marginTop: 6 },
+  modalInfoCard: {
+    marginTop: 18,
+    marginBottom: 10,
+    borderRadius: 18,
+    backgroundColor: '#EDF7F2',
+    borderWidth: 1,
+    borderColor: '#D5EADF',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  modalInfoTitle: {
+    fontSize: 12,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+    color: '#4A6B61',
+    marginBottom: 6,
+  },
+  modalInfoText: {
+    fontSize: 14,
+    lineHeight: 20,
+    color: '#587169',
+  },
+  modalFieldGroup: {
+    marginTop: 12,
+  },
+  modalFieldLabel: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#45625A',
+    textTransform: 'uppercase',
+    letterSpacing: 0.7,
+    marginBottom: 8,
+  },
   modalInput: {
     borderWidth: 1,
     borderColor: '#D0DDD6',
@@ -512,7 +708,11 @@ const styles = StyleSheet.create({
     fontSize: 15,
     color: '#17352D',
     backgroundColor: '#FFFFFF',
-    marginTop: 10,
+  },
+  modalCodeInput: {
+    fontSize: 22,
+    fontWeight: '800',
+    letterSpacing: 4,
   },
   modalActions: { flexDirection: 'row', gap: 10, marginTop: 18 },
   modalSecondaryBtn: {

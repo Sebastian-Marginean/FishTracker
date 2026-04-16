@@ -1,18 +1,21 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
-  TextInput, ActivityIndicator, Alert, RefreshControl,
+  TextInput, ActivityIndicator, Alert, RefreshControl, Image, Modal,
 } from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
+import PasswordStrengthMeter from '../../components/PasswordStrengthMeter';
 import SuccessSheet from '../../components/SuccessSheet';
+import { uploadImageToSupabase } from '../../lib/mediaUpload';
 import { supabase } from '../../lib/supabase';
 import { formatDate, formatDateTime, useI18n } from '../../i18n';
 import { useAuthStore } from '../../store/authStore';
 import { useLanguageStore } from '../../store/languageStore';
 import { useThemeStore } from '../../store/themeStore';
 import { getAppTheme } from '../../theme';
-import type { Catch, Group, Location, Message } from '../../types';
+import type { Catch, Group, Location, Message, Profile as FishProfile } from '../../types';
 
 interface ProfileStats {
   catches: number;
@@ -26,7 +29,15 @@ interface SuccessState {
   details?: string;
 }
 
-type AdminTab = 'locations' | 'catches' | 'groups' | 'messages';
+interface NoticeState {
+  title: string;
+  message: string;
+  details?: string;
+}
+
+type AdminTab = 'locations' | 'catches' | 'groups' | 'messages' | 'users';
+type ModerationKind = 'mute' | 'ban';
+type ModerationDuration = '1h' | '24h' | '7d' | '30d' | 'permanent';
 
 type AdminLocation = Pick<Location, 'id' | 'name' | 'created_at'> & { created_by?: string };
 type AdminCatch = Pick<Catch, 'id' | 'fish_species' | 'weight_kg' | 'caught_at' | 'user_id'> & {
@@ -37,6 +48,34 @@ type AdminGroup = Pick<Group, 'id' | 'name' | 'invite_code' | 'created_at' | 'ow
 type AdminMessage = Pick<Message, 'id' | 'content' | 'created_at' | 'user_id'> & {
   profiles?: { username?: string } | null;
 };
+type AdminUser = Pick<FishProfile, 'id' | 'username' | 'full_name' | 'role' | 'created_at' | 'muted_until' | 'mute_permanent' | 'banned_until' | 'ban_permanent'>;
+
+function isRateLimitMessage(message: string) {
+  return /email rate limit exceeded|too many requests/i.test(message);
+}
+
+function getFriendlyAuthMessage(
+  message: string,
+  t: (key: string, params?: Record<string, string | number>) => string,
+) {
+  if (isRateLimitMessage(message)) {
+    return t('auth.emailRateLimit');
+  }
+
+  if (/already been registered|already exists|exista deja un cont/i.test(message)) {
+    return t('auth.accountAlreadyExists');
+  }
+
+  if (/username-ul este deja folosit|username is already|username already exists/i.test(message)) {
+    return t('auth.usernameTaken');
+  }
+
+  return message;
+}
+
+function normalizeUsername(value: string) {
+  return value.trim().replace(/\s+/g, ' ');
+}
 
 export default function ProfileScreen() {
   const { user, profile, updateProfile, updateEmail, updatePassword, fetchProfile, signOut } = useAuthStore();
@@ -46,16 +85,22 @@ export default function ProfileScreen() {
   const mode = useThemeStore((state) => state.mode);
   const toggleMode = useThemeStore((state) => state.toggleMode);
   const theme = getAppTheme(mode);
+  const [username, setUsername] = useState('');
   const [fullName, setFullName] = useState('');
   const [bio, setBio] = useState('');
   const [newEmail, setNewEmail] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
+  const [avatarUri, setAvatarUri] = useState<string | null>(null);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmNewPassword, setShowConfirmNewPassword] = useState(false);
   const [stats, setStats] = useState<ProfileStats>({ catches: 0, sessions: 0, groups: 0 });
   const [saving, setSaving] = useState(false);
+  const [updatingAvatar, setUpdatingAvatar] = useState(false);
   const [updatingEmail, setUpdatingEmail] = useState(false);
   const [updatingPassword, setUpdatingPassword] = useState(false);
   const [successState, setSuccessState] = useState<SuccessState | null>(null);
+  const [noticeState, setNoticeState] = useState<NoticeState | null>(null);
   const [emailCooldownUntil, setEmailCooldownUntil] = useState<number | null>(null);
   const [emailCooldownLeft, setEmailCooldownLeft] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
@@ -65,8 +110,21 @@ export default function ProfileScreen() {
   const [adminCatches, setAdminCatches] = useState<AdminCatch[]>([]);
   const [adminGroups, setAdminGroups] = useState<AdminGroup[]>([]);
   const [adminMessages, setAdminMessages] = useState<AdminMessage[]>([]);
+  const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
+  const [adminUserSearch, setAdminUserSearch] = useState('');
+  const [moderationUser, setModerationUser] = useState<AdminUser | null>(null);
+  const [moderationKind, setModerationKind] = useState<ModerationKind>('mute');
+  const [moderationDuration, setModerationDuration] = useState<ModerationDuration>('24h');
 
   const isAdmin = profile?.role === 'admin';
+
+  const openWarningNotice = (title: string, message: string, details?: string) => {
+    setNoticeState({ title, message, details });
+  };
+
+  const openAuthErrorNotice = (title: string, message: string) => {
+    openWarningNotice(title, getFriendlyAuthMessage(message, t));
+  };
 
   useEffect(() => {
     if (!emailCooldownUntil) {
@@ -91,9 +149,14 @@ export default function ProfileScreen() {
   }, [emailCooldownUntil]);
 
   useEffect(() => {
+    setUsername(profile?.username ?? '');
     setFullName(profile?.full_name ?? '');
     setBio(profile?.bio ?? '');
-  }, [profile?.full_name, profile?.bio]);
+  }, [profile?.username, profile?.full_name, profile?.bio]);
+
+  useEffect(() => {
+    setAvatarUri(profile?.avatar_url ?? null);
+  }, [profile?.avatar_url]);
 
   const loadProfileData = useCallback(async () => {
     if (!user) return;
@@ -128,20 +191,101 @@ export default function ProfileScreen() {
       .select('id, content, created_at, user_id, profiles:profiles!messages_user_id_fkey(username)')
       .order('created_at', { ascending: false })
       .limit(10);
+    const usersQuery = supabase
+      .from('profiles')
+      .select('id, username, full_name, role, created_at, muted_until, mute_permanent, banned_until, ban_permanent')
+      .neq('id', user.id)
+      .order('created_at', { ascending: false })
+      .limit(200);
 
-    const [locationsRes, catchesRes, groupsRes, messagesRes] = await Promise.all([
+    const [locationsRes, catchesRes, groupsRes, messagesRes, usersRes] = await Promise.all([
       isAdmin ? locationsQuery : locationsQuery.eq('created_by', user.id),
       isAdmin ? catchesQuery : catchesQuery.eq('user_id', user.id),
       isAdmin ? groupsQuery : groupsQuery.eq('owner_id', user.id),
       isAdmin ? messagesQuery : messagesQuery.eq('user_id', user.id),
+      isAdmin ? usersQuery : Promise.resolve({ data: [] as AdminUser[] }),
     ]);
 
     setAdminLocations((locationsRes.data ?? []) as AdminLocation[]);
     setAdminCatches((catchesRes.data ?? []) as AdminCatch[]);
     setAdminGroups((groupsRes.data ?? []) as AdminGroup[]);
     setAdminMessages((messagesRes.data ?? []) as AdminMessage[]);
+    setAdminUsers((usersRes.data ?? []) as AdminUser[]);
     setAdminLoading(false);
   }, [isAdmin, user]);
+
+  const moderationOptions = useMemo(() => [
+    { key: '1h' as const, label: t('profile.moderationDuration1h'), ms: 60 * 60 * 1000 },
+    { key: '24h' as const, label: t('profile.moderationDuration24h'), ms: 24 * 60 * 60 * 1000 },
+    { key: '7d' as const, label: t('profile.moderationDuration7d'), ms: 7 * 24 * 60 * 60 * 1000 },
+    { key: '30d' as const, label: t('profile.moderationDuration30d'), ms: 30 * 24 * 60 * 60 * 1000 },
+    { key: 'permanent' as const, label: t('profile.moderationDurationPermanent'), ms: null },
+  ], [t]);
+
+  const filteredAdminUsers = useMemo(() => {
+    const term = adminUserSearch.trim().toLowerCase();
+    if (!term) return adminUsers;
+    return adminUsers.filter((item) => {
+      const username = item.username?.toLowerCase() ?? '';
+      const fullName = item.full_name?.toLowerCase() ?? '';
+      return username.includes(term) || fullName.includes(term);
+    });
+  }, [adminUserSearch, adminUsers]);
+
+  const isModerationActive = (item: AdminUser, kind: ModerationKind) => {
+    const permanent = kind === 'mute' ? item.mute_permanent : item.ban_permanent;
+    const until = kind === 'mute' ? item.muted_until : item.banned_until;
+    return !!permanent || (!!until && new Date(until).getTime() > Date.now());
+  };
+
+  const getModerationStatusLabel = (item: AdminUser, kind: ModerationKind) => {
+    const permanent = kind === 'mute' ? item.mute_permanent : item.ban_permanent;
+    const until = kind === 'mute' ? item.muted_until : item.banned_until;
+    if (!isModerationActive(item, kind)) return null;
+    if (permanent) return t('profile.moderationPermanent');
+    if (!until) return null;
+    return kind === 'mute'
+      ? t('profile.moderationMutedUntil', { date: formatDateTime(language, until) })
+      : t('profile.moderationBannedUntil', { date: formatDateTime(language, until) });
+  };
+
+  const applyModeration = async (kind: ModerationKind, action: 'set' | 'clear') => {
+    if (!moderationUser) return;
+
+    const selectedOption = moderationOptions.find((item) => item.key === moderationDuration);
+    const untilValue = action === 'set' && selectedOption?.ms
+      ? new Date(Date.now() + selectedOption.ms).toISOString()
+      : null;
+    const updates = kind === 'mute'
+      ? {
+          mute_permanent: action === 'set' ? moderationDuration === 'permanent' : false,
+          muted_until: action === 'set' ? untilValue : null,
+        }
+      : {
+          ban_permanent: action === 'set' ? moderationDuration === 'permanent' : false,
+          banned_until: action === 'set' ? untilValue : null,
+        };
+
+    const { error } = await supabase.from('profiles').update(updates).eq('id', moderationUser.id);
+    if (error) {
+      openWarningNotice(t('common.error'), error.message);
+      return;
+    }
+
+    setSuccessState({
+      title: t('profile.updatedTitle'),
+      message: action === 'set'
+        ? (kind === 'mute'
+            ? t('profile.userMutedMessage', { username: moderationUser.username })
+            : t('profile.userBannedMessage', { username: moderationUser.username }))
+        : (kind === 'mute'
+            ? t('profile.userUnmutedMessage', { username: moderationUser.username })
+            : t('profile.userUnbannedMessage', { username: moderationUser.username })),
+    });
+
+    setModerationUser(null);
+    await loadAdminData();
+  };
 
   const refreshAll = useCallback(async () => {
     setRefreshing(true);
@@ -158,30 +302,100 @@ export default function ProfileScreen() {
   );
 
   const handleSaveProfile = async () => {
-    setSaving(true);
-    const { error } = await updateProfile({
-      full_name: fullName.trim() || null,
-      bio: bio.trim() || null,
-    } as any);
-    setSaving(false);
+    const submittedUsername = normalizeUsername(username);
+    const currentUsername = normalizeUsername(profile?.username ?? '');
 
-    if (error) {
-      Alert.alert(t('common.error'), error);
+    if (!submittedUsername) {
+      openWarningNotice(t('auth.validationTitle'), t('auth.fillAllFields'));
       return;
     }
 
-    Alert.alert(t('profile.updatedTitle'), t('profile.updatedMessage'));
+    if (submittedUsername.length < 3) {
+      openWarningNotice(t('auth.validationTitle'), t('auth.usernameTooShort'));
+      return;
+    }
+
+    if (submittedUsername.toLowerCase() !== currentUsername.toLowerCase()) {
+      const { data, error } = await supabase.rpc('find_profile_by_username', { lookup_username: submittedUsername });
+
+      if (error) {
+        openWarningNotice(t('common.error'), getFriendlyAuthMessage(error.message, t));
+        return;
+      }
+
+      const existingUser = Array.isArray(data) ? data[0] : null;
+      if (existingUser?.id && existingUser.id !== user?.id) {
+        openWarningNotice(t('auth.validationTitle'), t('auth.usernameTaken'));
+        return;
+      }
+    }
+
+    setSaving(true);
+
+    let avatarUrl = profile?.avatar_url ?? null;
+
+    if (avatarUri && avatarUri !== profile?.avatar_url) {
+      try {
+        setUpdatingAvatar(true);
+        avatarUrl = await uploadImageToSupabase({
+          bucket: 'avatars',
+          folder: 'profiles',
+          uri: avatarUri,
+          userId: user?.id,
+        });
+      } catch (error) {
+        setUpdatingAvatar(false);
+        setSaving(false);
+        openWarningNotice(
+          t('common.error'),
+          `${t('profile.avatarUploadFailed')}\n\n${error instanceof Error ? error.message : ''}`.trim()
+        );
+        return;
+      }
+    }
+
+    const { error } = await updateProfile({
+      username: submittedUsername,
+      full_name: fullName.trim() || null,
+      bio: bio.trim() || null,
+      avatar_url: avatarUrl,
+    } as any);
+    setUpdatingAvatar(false);
+    setSaving(false);
+
+    if (error) {
+      openWarningNotice(t('common.error'), getFriendlyAuthMessage(error, t));
+      return;
+    }
+
+    setSuccessState({
+      title: t('profile.updatedTitle'),
+      message: t('profile.updatedMessage'),
+    });
     await fetchProfile();
+  };
+
+  const pickAvatar = async () => {
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.75,
+      allowsEditing: true,
+      aspect: [1, 1],
+    });
+
+    if (!result.canceled) {
+      setAvatarUri(result.assets[0].uri);
+    }
   };
 
   const handleChangeEmail = async () => {
     if (!newEmail.trim()) {
-      Alert.alert(t('common.error'), t('auth.emailRequired'));
+      openWarningNotice(t('auth.validationTitle'), t('auth.emailRequired'));
       return;
     }
 
     if (emailCooldownLeft > 0) {
-      Alert.alert(t('common.info'), t('auth.emailCooldown', { seconds: emailCooldownLeft }));
+      openWarningNotice(t('auth.rateLimitTitle'), t('auth.rateLimitMessage'), t('auth.emailCooldown', { seconds: emailCooldownLeft }));
       return;
     }
 
@@ -190,13 +404,13 @@ export default function ProfileScreen() {
     setUpdatingEmail(false);
 
     if (error) {
-      if (/email rate limit exceeded/i.test(error)) {
+      if (isRateLimitMessage(error)) {
         setEmailCooldownUntil(Date.now() + 60_000);
-        Alert.alert(t('common.error'), t('auth.emailRateLimit'));
+        openWarningNotice(t('auth.rateLimitTitle'), t('auth.rateLimitMessage'), t('auth.emailCooldown', { seconds: 60 }));
         return;
       }
 
-      Alert.alert(t('common.error'), error);
+      openAuthErrorNotice(t('common.error'), error);
       return;
     }
 
@@ -212,15 +426,15 @@ export default function ProfileScreen() {
 
   const handleChangePassword = async () => {
     if (!newPassword.trim()) {
-      Alert.alert(t('common.error'), t('auth.passwordTooShort'));
+      openWarningNotice(t('auth.validationTitle'), t('auth.passwordTooShort'));
       return;
     }
-    if (newPassword.length < 6) {
-      Alert.alert(t('common.error'), t('auth.passwordTooShort'));
+    if (newPassword.length < 8) {
+      openWarningNotice(t('auth.validationTitle'), t('auth.passwordTooShort'));
       return;
     }
     if (newPassword !== confirmNewPassword) {
-      Alert.alert(t('common.error'), t('auth.passwordMismatch'));
+      openWarningNotice(t('auth.validationTitle'), t('auth.passwordMismatch'));
       return;
     }
 
@@ -229,13 +443,16 @@ export default function ProfileScreen() {
     setUpdatingPassword(false);
 
     if (error) {
-      Alert.alert(t('common.error'), error);
+      openAuthErrorNotice(t('common.error'), error);
       return;
     }
 
     setNewPassword('');
     setConfirmNewPassword('');
-    Alert.alert(t('profile.passwordUpdatedTitle'), t('profile.passwordUpdatedMessage'));
+    setSuccessState({
+      title: t('profile.passwordUpdatedTitle'),
+      message: t('profile.passwordUpdatedMessage'),
+    });
   };
 
   const handleDelete = async (table: 'locations' | 'catches' | 'groups' | 'messages', id: string, label: string) => {
@@ -267,7 +484,8 @@ export default function ProfileScreen() {
     { key: 'catches' as const, label: t('profile.catchesTab') },
     { key: 'groups' as const, label: t('profile.groupsTab') },
     { key: 'messages' as const, label: t('profile.messagesTab') },
-  ], [t]);
+    ...(isAdmin ? [{ key: 'users' as const, label: t('profile.usersTab') }] : []),
+  ], [isAdmin, t]);
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.background }]}> 
@@ -277,9 +495,18 @@ export default function ProfileScreen() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refreshAll} tintColor={theme.primary} />}
       >
         <View style={[styles.headerCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
-          <View style={[styles.avatar, { backgroundColor: theme.primary }]}>
-            <Text style={styles.avatarText}>{profile?.username?.[0]?.toUpperCase() ?? '?'}</Text>
-          </View>
+          <TouchableOpacity style={[styles.avatarWrap, { borderColor: theme.borderSoft }]} onPress={pickAvatar} activeOpacity={0.9}>
+            {avatarUri ? (
+              <Image source={{ uri: avatarUri }} style={styles.avatar} />
+            ) : (
+              <View style={[styles.avatar, { backgroundColor: theme.primary }]}>
+                <Text style={styles.avatarText}>{profile?.username?.[0]?.toUpperCase() ?? '?'}</Text>
+              </View>
+            )}
+            <View style={[styles.avatarBadge, { backgroundColor: theme.primaryStrong }]}>
+              <Text style={styles.avatarBadgeText}>{updatingAvatar ? '…' : '+'}</Text>
+            </View>
+          </TouchableOpacity>
           <View style={{ flex: 1 }}>
             <View style={styles.nameRow}>
               <Text style={[styles.username, { color: theme.text }]}>@{profile?.username ?? t('profile.userFallback')}</Text>
@@ -291,6 +518,7 @@ export default function ProfileScreen() {
             </View>
             <Text style={[styles.email, { color: theme.textMuted }]}>{user?.email ?? t('profile.noEmail')}</Text>
             <Text style={[styles.joined, { color: theme.textSoft }]}>{t('profile.memberSince', { date: profile?.created_at ? formatDate(language, profile.created_at) : '-' })}</Text>
+            <Text style={[styles.avatarHint, { color: theme.textSoft }]}>{t('profile.avatarHint')}</Text>
           </View>
         </View>
 
@@ -302,6 +530,15 @@ export default function ProfileScreen() {
 
         <View style={[styles.sectionCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
           <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('profile.myProfile')}</Text>
+          <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('auth.username')}</Text>
+          <TextInput
+            style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+            placeholder={t('auth.username')}
+            placeholderTextColor="#bbb"
+            value={username}
+            onChangeText={setUsername}
+            autoCapitalize="none"
+          />
           <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('profile.displayName')}</Text>
           <TextInput
             style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
@@ -381,24 +618,35 @@ export default function ProfileScreen() {
             )}
 
             <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('profile.newPassword')}</Text>
-            <TextInput
-              style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
-              placeholder={t('profile.newPasswordPlaceholder')}
-              placeholderTextColor="#bbb"
-              value={newPassword}
-              onChangeText={setNewPassword}
-              secureTextEntry
-            />
+            <View style={styles.passwordInputWrap}>
+              <TextInput
+                style={[styles.input, styles.passwordInput, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+                placeholder={t('profile.newPasswordPlaceholder')}
+                placeholderTextColor="#bbb"
+                value={newPassword}
+                onChangeText={setNewPassword}
+                secureTextEntry={!showNewPassword}
+              />
+              <TouchableOpacity style={[styles.passwordToggle, { backgroundColor: theme.surfaceAlt }]} onPress={() => setShowNewPassword((value) => !value)}>
+                <Text style={[styles.passwordToggleText, { color: theme.primary }]}>{showNewPassword ? t('common.hide') : t('common.show')}</Text>
+              </TouchableOpacity>
+            </View>
+            <PasswordStrengthMeter password={newPassword} variant="profile" />
 
             <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('profile.confirmNewPassword')}</Text>
-            <TextInput
-              style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
-              placeholder={t('profile.confirmNewPasswordPlaceholder')}
-              placeholderTextColor="#bbb"
-              value={confirmNewPassword}
-              onChangeText={setConfirmNewPassword}
-              secureTextEntry
-            />
+            <View style={styles.passwordInputWrap}>
+              <TextInput
+                style={[styles.input, styles.passwordInput, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+                placeholder={t('profile.confirmNewPasswordPlaceholder')}
+                placeholderTextColor="#bbb"
+                value={confirmNewPassword}
+                onChangeText={setConfirmNewPassword}
+                secureTextEntry={!showConfirmNewPassword}
+              />
+              <TouchableOpacity style={[styles.passwordToggle, { backgroundColor: theme.surfaceAlt }]} onPress={() => setShowConfirmNewPassword((value) => !value)}>
+                <Text style={[styles.passwordToggleText, { color: theme.primary }]}>{showConfirmNewPassword ? t('common.hide') : t('common.show')}</Text>
+              </TouchableOpacity>
+            </View>
             <TouchableOpacity style={[styles.tertiaryBtn, { backgroundColor: theme.primary }, updatingPassword && styles.disabledBtn]} onPress={handleChangePassword} disabled={updatingPassword}>
               {updatingPassword ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>{t('profile.changePassword')}</Text>}
             </TouchableOpacity>
@@ -490,11 +738,94 @@ export default function ProfileScreen() {
                 {activeAdminTab === 'catches' && adminCatches.length === 0 && <EmptyAdminState label={isAdmin ? t('profile.noCatchesToModerate') : t('profile.noCatchesYet')} theme={theme} />}
                 {activeAdminTab === 'groups' && adminGroups.length === 0 && <EmptyAdminState label={isAdmin ? t('profile.noGroupsToModerate') : t('profile.noGroupsYet')} theme={theme} />}
                 {activeAdminTab === 'messages' && adminMessages.length === 0 && <EmptyAdminState label={isAdmin ? t('profile.noMessagesToModerate') : t('profile.noMessagesYet')} theme={theme} />}
+                {activeAdminTab === 'users' && (
+                  <TextInput
+                    style={[styles.input, styles.adminSearchInput, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+                    placeholder={t('profile.searchUsersPlaceholder')}
+                    placeholderTextColor={theme.textSoft}
+                    value={adminUserSearch}
+                    onChangeText={setAdminUserSearch}
+                    autoCapitalize="none"
+                  />
+                )}
+                {activeAdminTab === 'users' && filteredAdminUsers.map((item) => (
+                  <View key={item.id} style={[styles.adminRow, { borderTopColor: theme.borderSoft }]}> 
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.adminRowTitle, { color: theme.text }]}>@{item.username}</Text>
+                      <Text style={[styles.adminRowSubtitle, { color: theme.textMuted }]}>{item.full_name?.trim() || t('profile.userFallback')}</Text>
+                      {getModerationStatusLabel(item, 'mute') ? <Text style={[styles.adminRowSubtitle, { color: theme.primary }]}>{getModerationStatusLabel(item, 'mute')}</Text> : null}
+                      {getModerationStatusLabel(item, 'ban') ? <Text style={[styles.adminRowSubtitle, { color: theme.dangerText }]}>{getModerationStatusLabel(item, 'ban')}</Text> : null}
+                    </View>
+                    <View style={styles.moderationActions}>
+                      <TouchableOpacity
+                        style={[styles.moderationBtn, { backgroundColor: isModerationActive(item, 'mute') ? theme.surfaceAlt : theme.primarySoft }]}
+                        onPress={() => {
+                          setModerationUser(item);
+                          setModerationKind('mute');
+                          setModerationDuration('24h');
+                          if (isModerationActive(item, 'mute')) {
+                            void applyModeration('mute', 'clear');
+                            return;
+                          }
+                        }}
+                      >
+                        <Text style={[styles.moderationBtnText, { color: isModerationActive(item, 'mute') ? theme.text : (mode === 'dark' ? '#dcfff3' : theme.primaryStrong) }]}>{isModerationActive(item, 'mute') ? t('profile.unmuteUser') : t('profile.muteUser')}</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.moderationBtn, { backgroundColor: isModerationActive(item, 'ban') ? theme.surfaceAlt : theme.dangerSoft }]}
+                        onPress={() => {
+                          setModerationUser(item);
+                          setModerationKind('ban');
+                          setModerationDuration('24h');
+                          if (isModerationActive(item, 'ban')) {
+                            void applyModeration('ban', 'clear');
+                            return;
+                          }
+                        }}
+                      >
+                        <Text style={[styles.moderationBtnText, { color: isModerationActive(item, 'ban') ? theme.text : theme.dangerText }]}>{isModerationActive(item, 'ban') ? t('profile.unbanUser') : t('profile.banUser')}</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                ))}
+                {activeAdminTab === 'users' && adminUsers.length === 0 && <EmptyAdminState label={t('profile.noUsersToModerate')} theme={theme} />}
+                {activeAdminTab === 'users' && adminUsers.length > 0 && filteredAdminUsers.length === 0 && <EmptyAdminState label={t('profile.noUsersMatch')} theme={theme} />}
               </>
             )}
           </View>
         )}
       </ScrollView>
+
+      <Modal visible={!!moderationUser && !isModerationActive(moderationUser, moderationKind)} transparent animationType="slide" onRequestClose={() => setModerationUser(null)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalCard, { backgroundColor: theme.surface }]}> 
+            <Text style={[styles.modalTitle, { color: theme.text }]}>{t('profile.moderationTitle')}</Text>
+            <Text style={[styles.modalSub, { color: theme.textMuted }]}>{moderationUser ? `@${moderationUser.username} · ${t('profile.moderationSubtitle')}` : t('profile.moderationSubtitle')}</Text>
+            <View style={styles.durationGrid}>
+              {moderationOptions.map((option) => (
+                <TouchableOpacity
+                  key={option.key}
+                  style={[
+                    styles.durationChip,
+                    { backgroundColor: moderationDuration === option.key ? theme.primary : theme.surfaceAlt },
+                  ]}
+                  onPress={() => setModerationDuration(option.key)}
+                >
+                  <Text style={[styles.durationChipText, { color: moderationDuration === option.key ? '#fff' : theme.text }]}>{option.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <View style={styles.modalActions}>
+              <TouchableOpacity style={[styles.cancelBtn, { borderColor: theme.border }]} onPress={() => setModerationUser(null)}>
+                <Text style={[styles.cancelText, { color: theme.textMuted }]}>{t('common.cancel')}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.confirmBtn, { backgroundColor: moderationKind === 'ban' ? theme.dangerText : theme.primary }]} onPress={() => void applyModeration(moderationKind, 'set')}>
+                <Text style={styles.confirmText}>{t('profile.moderationApply')}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       <SuccessSheet
         visible={!!successState}
@@ -502,6 +833,18 @@ export default function ProfileScreen() {
         message={successState?.message ?? ''}
         details={successState?.details}
         onClose={() => setSuccessState(null)}
+      />
+
+      <SuccessSheet
+        visible={!!noticeState}
+        title={noticeState?.title ?? ''}
+        message={noticeState?.message ?? ''}
+        details={noticeState?.details}
+        detailsLabel={t('auth.rateLimitDetailsLabel')}
+        buttonLabel={t('auth.ok')}
+        autoCloseMs={5000}
+        variant="warning"
+        onClose={() => setNoticeState(null)}
       />
     </SafeAreaView>
   );
@@ -553,6 +896,12 @@ const styles = StyleSheet.create({
     borderWidth: 0.5,
     borderColor: '#e9e9e9',
   },
+  avatarWrap: {
+    position: 'relative',
+    borderRadius: 36,
+    borderWidth: 1,
+    padding: 4,
+  },
   avatar: {
     width: 64,
     height: 64,
@@ -561,7 +910,19 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  avatarBadge: {
+    position: 'absolute',
+    right: -2,
+    bottom: -2,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarBadgeText: { color: '#fff', fontSize: 14, fontWeight: '900', lineHeight: 16 },
   avatarText: { color: '#fff', fontSize: 26, fontWeight: '800' },
+  avatarHint: { fontSize: 12, marginTop: 6 },
   nameRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   username: { fontSize: 18, fontWeight: '800', color: '#1a1a1a' },
   adminBadge: { backgroundColor: '#FAEEDA', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999 },
@@ -601,6 +962,24 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     fontSize: 14,
     color: '#1a1a1a',
+  },
+  passwordInputWrap: {
+    position: 'relative',
+    justifyContent: 'center',
+  },
+  passwordInput: {
+    paddingRight: 84,
+  },
+  passwordToggle: {
+    position: 'absolute',
+    right: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 999,
+  },
+  passwordToggleText: {
+    fontSize: 12,
+    fontWeight: '800',
   },
   textArea: { minHeight: 92, textAlignVertical: 'top' },
   primaryBtn: {
@@ -655,6 +1034,7 @@ const styles = StyleSheet.create({
   langButtonText: { fontSize: 12, fontWeight: '800' },
 
   adminTabsRow: { gap: 8, paddingBottom: 12 },
+  adminSearchInput: { marginBottom: 12 },
   adminTab: { backgroundColor: '#f1f1f1', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999 },
   adminTabActive: { backgroundColor: '#1D9E75' },
   adminTabText: { color: '#666', fontSize: 13, fontWeight: '600' },
@@ -670,6 +1050,21 @@ const styles = StyleSheet.create({
   },
   adminRowTitle: { fontSize: 14, fontWeight: '700', color: '#1a1a1a' },
   adminRowSubtitle: { fontSize: 12, color: '#888', marginTop: 4 },
+  moderationActions: { gap: 8 },
+  moderationBtn: { borderRadius: 10, paddingHorizontal: 10, paddingVertical: 9, minWidth: 96, alignItems: 'center' },
+  moderationBtnText: { fontSize: 12, fontWeight: '800' },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'flex-end' },
+  modalCard: { borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24 },
+  modalTitle: { fontSize: 18, fontWeight: '800', marginBottom: 4 },
+  modalSub: { fontSize: 13, marginBottom: 14 },
+  durationGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 14 },
+  durationChip: { borderRadius: 999, paddingHorizontal: 14, paddingVertical: 10 },
+  durationChipText: { fontSize: 12, fontWeight: '800' },
+  modalActions: { flexDirection: 'row', gap: 10 },
+  cancelBtn: { flex: 1, borderRadius: 12, borderWidth: 1, paddingVertical: 12, alignItems: 'center' },
+  cancelText: { fontSize: 13, fontWeight: '700' },
+  confirmBtn: { flex: 1, borderRadius: 12, paddingVertical: 12, alignItems: 'center' },
+  confirmText: { fontSize: 13, fontWeight: '800', color: '#fff' },
   deleteBtn: { backgroundColor: '#FFF1F1', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10 },
   deleteBtnText: { color: '#C53A3A', fontWeight: '800', fontSize: 12 },
   emptyAdminState: { paddingVertical: 20, alignItems: 'center' },

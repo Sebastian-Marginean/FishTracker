@@ -10,7 +10,7 @@ import {
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import ConfirmActionSheet from '../../components/ConfirmActionSheet';
-import { formatDate, formatTime, useI18n } from '../../i18n';
+import { formatDate, formatDateTime, formatTime, useI18n } from '../../i18n';
 import MessageActionSheet from '../../components/MessageActionSheet';
 import SuccessSheet from '../../components/SuccessSheet';
 import { supabase } from '../../lib/supabase';
@@ -20,12 +20,45 @@ import { useUnreadStore } from '../../store/unreadStore';
 import { getAppTheme } from '../../theme';
 import type { Group, GroupMessage } from '../../types';
 
+interface GroupSetupHistoryRow {
+  id: string;
+  session_id: string;
+  rod_id?: string | null;
+  rod_number: number;
+  bait_name?: string | null;
+  hook_setup?: string | null;
+  created_at: string;
+}
+
+function findCatchSetup(
+  catchItem: { caught_at: string; rod_id?: string | null; rod_number?: number | null; rods?: { bait_custom?: string | null; hook_setup?: string | null } | null },
+  setupHistory: GroupSetupHistoryRow[],
+) {
+  const catchTimestamp = new Date(catchItem.caught_at).getTime();
+  const matchingEntries = setupHistory
+    .filter((entry) => {
+      if (new Date(entry.created_at).getTime() > catchTimestamp) return false;
+      if (catchItem.rod_id && entry.rod_id) return entry.rod_id === catchItem.rod_id;
+      if (catchItem.rod_number) return entry.rod_number === catchItem.rod_number;
+      return false;
+    })
+    .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
+
+  const latestEntry = matchingEntries[0];
+
+  return {
+    bait: latestEntry?.bait_name?.trim() || catchItem.rods?.bait_custom?.trim() || '',
+    hook: latestEntry?.hook_setup?.trim() || catchItem.rods?.hook_setup?.trim() || '',
+  };
+}
+
 interface SuccessState {
   title: string;
   message: string;
   details?: string;
   detailsLabel?: string;
   copyValue?: string;
+  variant?: 'success' | 'warning';
 }
 
 export default function GroupsScreen() {
@@ -42,6 +75,7 @@ export default function GroupsScreen() {
   const [loading, setLoading] = useState(true);
   const [activeGroup, setActiveGroup] = useState<Group | null>(null);
   const [groupCatches, setGroupCatches] = useState<any[]>([]);
+  const [groupSetupHistory, setGroupSetupHistory] = useState<GroupSetupHistoryRow[]>([]);
   const [groupMembers, setGroupMembers] = useState<any[]>([]);
   const [groupMessages, setGroupMessages] = useState<any[]>([]);
   const [groupMessageText, setGroupMessageText] = useState('');
@@ -52,6 +86,7 @@ export default function GroupsScreen() {
   // Modals
   const [createModal, setCreateModal] = useState(false);
   const [joinModal, setJoinModal] = useState(false);
+  const [editingGroup, setEditingGroup] = useState<Group | null>(null);
   const [newGroupName, setNewGroupName] = useState('');
   const [newGroupDesc, setNewGroupDesc] = useState('');
   const [inviteCode, setInviteCode] = useState('');
@@ -61,6 +96,64 @@ export default function GroupsScreen() {
   const [messageActionState, setMessageActionState] = useState<any | null>(null);
   const [pendingDeleteMessageId, setPendingDeleteMessageId] = useState<string | null>(null);
   const keyboardBehavior = Platform.OS === 'ios' ? 'padding' : 'height';
+  const canManageActiveGroup = !!activeGroup && !!user?.id && (activeGroup.owner_id === user.id || isAdmin);
+  const isModerated = (
+    kind: 'mute' | 'ban',
+    item?: { muted_until?: string | null; mute_permanent?: boolean; banned_until?: string | null; ban_permanent?: boolean } | null,
+  ) => {
+    if (!item) return false;
+    if (kind === 'mute') {
+      return !!item.mute_permanent || (!!item.muted_until && new Date(item.muted_until).getTime() > Date.now());
+    }
+    return !!item.ban_permanent || (!!item.banned_until && new Date(item.banned_until).getTime() > Date.now());
+  };
+
+  const getModerationStatus = (
+    kind: 'mute' | 'ban',
+    item?: { muted_until?: string | null; mute_permanent?: boolean; banned_until?: string | null; ban_permanent?: boolean } | null,
+  ) => {
+    if (!item || !isModerated(kind, item)) return null;
+    if (kind === 'mute') {
+      if (item.mute_permanent) return t('profile.moderationPermanent');
+      if (!item.muted_until) return null;
+      return t('profile.moderationMutedUntil', { date: formatDateTime(language, item.muted_until) });
+    }
+    if (item.ban_permanent) return t('profile.moderationPermanent');
+    if (!item.banned_until) return null;
+    return t('profile.moderationBannedUntil', { date: formatDateTime(language, item.banned_until) });
+  };
+
+  const resolveMessagingRestrictionState = async (errorMessage?: string): Promise<SuccessState | null> => {
+    const normalizedMessage = errorMessage?.toLowerCase() ?? '';
+    if (!normalizedMessage.includes('row-level security')) return null;
+    if (!user?.id) return null;
+
+    const { data } = await supabase
+      .from('profiles')
+      .select('muted_until, mute_permanent, banned_until, ban_permanent')
+      .eq('id', user.id)
+      .single();
+
+    if (isModerated('mute', data)) {
+      return {
+        title: t('community.messageRestrictedTitle'),
+        message: t('community.messageMutedMessage'),
+        details: getModerationStatus('mute', data) ?? undefined,
+        variant: 'warning',
+      };
+    }
+
+    if (isModerated('ban', data)) {
+      return {
+        title: t('community.messageRestrictedTitle'),
+        message: t('community.messageBannedMessage'),
+        details: getModerationStatus('ban', data) ?? undefined,
+        variant: 'warning',
+      };
+    }
+
+    return null;
+  };
 
   useEffect(() => {
     void fetchMyGroups(user?.id);
@@ -161,11 +254,26 @@ export default function GroupsScreen() {
 
     const { data: catchData } = await supabase
       .from('catches')
-      .select('*, profiles(username)')
+      .select('id, session_id, rod_id, fish_species, weight_kg, length_cm, caught_at, notes, profiles(username), rods(rod_number, bait_custom, hook_setup)')
       .eq('group_id', groupId)
       .order('caught_at', { ascending: false })
       .limit(50);
-    if (catchData) setGroupCatches(catchData);
+    if (catchData) {
+      setGroupCatches(catchData);
+      const sessionIds = Array.from(new Set(catchData.map((item: any) => item.session_id).filter(Boolean)));
+      if (sessionIds.length > 0) {
+        const { data: setupData } = await supabase
+          .from('rod_setup_history')
+          .select('id, session_id, rod_id, rod_number, bait_name, hook_setup, created_at')
+          .in('session_id', sessionIds)
+          .order('created_at', { ascending: false });
+        setGroupSetupHistory((setupData ?? []) as GroupSetupHistoryRow[]);
+      } else {
+        setGroupSetupHistory([]);
+      }
+    } else {
+      setGroupSetupHistory([]);
+    }
 
     await fetchGroupMessages(groupId);
   };
@@ -257,6 +365,11 @@ export default function GroupsScreen() {
 
       if (error) {
         setGroupMessageText(content);
+        const restrictionState = await resolveMessagingRestrictionState(error.message);
+        if (restrictionState) {
+          setSuccessState(restrictionState);
+          return;
+        }
         Alert.alert(t('groups.messageEditFailed'), error.message);
         return;
       }
@@ -274,6 +387,11 @@ export default function GroupsScreen() {
 
     if (error) {
       setGroupMessageText(content);
+      const restrictionState = await resolveMessagingRestrictionState(error.message);
+      if (restrictionState) {
+        setSuccessState(restrictionState);
+        return;
+      }
       Alert.alert(t('groups.messageSendFailed'), error.message);
       return;
     }
@@ -334,6 +452,32 @@ export default function GroupsScreen() {
   const createGroup = async () => {
     if (!newGroupName.trim() || !user) return Alert.alert(t('common.error'), t('groups.groupNameRequired'));
     setSaving(true);
+
+    if (editingGroup) {
+      const { error } = await supabase
+        .from('groups')
+        .update({ name: newGroupName.trim(), description: newGroupDesc.trim() || null })
+        .eq('id', editingGroup.id);
+
+      setSaving(false);
+      if (error) {
+        return Alert.alert(t('common.error'), error.message);
+      }
+
+      const updatedGroup = { ...editingGroup, name: newGroupName.trim(), description: newGroupDesc.trim() || undefined };
+      setEditingGroup(null);
+      setCreateModal(false);
+      setNewGroupName('');
+      setNewGroupDesc('');
+      setActiveGroup(updatedGroup);
+      setMyGroups((current) => current.map((item) => item.id === updatedGroup.id ? updatedGroup : item));
+      setSuccessState({
+        title: t('groups.updatedTitle'),
+        message: t('groups.updatedMessage', { name: updatedGroup.name }),
+      });
+      return;
+    }
+
     const { data, error } = await supabase
       .from('groups')
       .insert({ owner_id: user.id, name: newGroupName.trim(), description: newGroupDesc.trim() || null })
@@ -359,6 +503,56 @@ export default function GroupsScreen() {
       copyValue: data.invite_code,
     });
     await fetchMyGroups(user.id);
+  };
+
+  const openEditGroupModal = () => {
+    if (!activeGroup) return;
+    setEditingGroup(activeGroup);
+    setNewGroupName(activeGroup.name);
+    setNewGroupDesc(activeGroup.description ?? '');
+    setCreateModal(true);
+  };
+
+  const resetGroupEditor = () => {
+    setEditingGroup(null);
+    setNewGroupName('');
+    setNewGroupDesc('');
+  };
+
+  const removeGroupMember = (member: any) => {
+    if (!activeGroup) return;
+
+    Alert.alert(
+      t('common.confirm'),
+      t('groups.removeMemberConfirm', { username: member.profiles?.username ?? t('groups.unknownUser') }),
+      [
+        { text: t('common.cancel'), style: 'cancel' },
+        {
+          text: t('groups.removeMember'),
+          style: 'destructive',
+          onPress: async () => {
+            const { error } = await supabase.from('group_members').delete().eq('id', member.id);
+            if (error) {
+              Alert.alert(t('common.error'), error.message);
+              return;
+            }
+
+            setSuccessState({
+              title: t('groups.memberRemovedTitle'),
+              message: t('groups.memberRemovedMessage', { username: member.profiles?.username ?? t('groups.unknownUser') }),
+            });
+            await fetchGroupData(activeGroup.id);
+            await fetchMyGroups(user?.id);
+          },
+        },
+      ]
+    );
+  };
+
+  const canRemoveMember = (member: any) => {
+    if (!user?.id || !activeGroup) return false;
+    if (isAdmin) return member.user_id !== user.id;
+    return activeGroup.owner_id === user.id && member.user_id !== user.id && member.role !== 'owner';
   };
 
   const joinGroup = async () => {
@@ -474,7 +668,11 @@ export default function GroupsScreen() {
               <Text style={[styles.backBtn, { color: theme.primary }]}>‹ {t('groups.back')}</Text>
             </TouchableOpacity>
             <Text style={[styles.detailTitle, { color: theme.text }]} numberOfLines={1}>{activeGroup?.name}</Text>
-            <View style={{ width: 60 }} />
+            {canManageActiveGroup ? (
+              <TouchableOpacity onPress={openEditGroupModal}>
+                <Text style={[styles.backBtn, { color: theme.primary }]}>{t('groups.editAction')}</Text>
+              </TouchableOpacity>
+            ) : <View style={{ width: 60 }} />}
           </View>
 
           {/* Cod invitare */}
@@ -573,12 +771,24 @@ export default function GroupsScreen() {
                 <View key={c.id} style={[styles.catchCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}>
                   <Text style={{ fontSize: 28 }}>🐟</Text>
                   <View style={{ flex: 1 }}>
+                    {c.rods?.rod_number ? (
+                      <Text style={[styles.catchDetailLine, { color: theme.primary }]}>{t('groups.catchRod', { number: c.rods.rod_number })}</Text>
+                    ) : null}
                     <Text style={[styles.catchTitle, { color: theme.text }]}>
                       {c.fish_species ?? t('groups.unknownFish')}{c.weight_kg ? ` · ${c.weight_kg} kg` : ''}
                     </Text>
                     <Text style={[styles.catchMeta, { color: theme.textMuted }]}>
-                      @{c.profiles?.username ?? t('groups.unknownUser')} · {formatDate(language, c.caught_at)}
+                      @{c.profiles?.username ?? t('groups.unknownUser')} · {formatDate(language, c.caught_at)} · {formatTime(language, c.caught_at, { hour: '2-digit', minute: '2-digit' })}
                     </Text>
+                    {(() => {
+                      const setup = findCatchSetup(c, groupSetupHistory);
+                      const hookValue = setup.hook || t('groups.noHookValue');
+                      return setup.bait
+                        ? <Text style={[styles.catchDetailLine, { color: theme.text }]}>{t('groups.catchSetup', { bait: setup.bait, hook: hookValue })}</Text>
+                        : <Text style={[styles.catchDetailLine, { color: theme.textSoft }]}>{t('groups.catchNoSetup')}</Text>;
+                    })()}
+                    {c.length_cm ? <Text style={[styles.catchDetailLine, { color: theme.textMuted }]}>{t('groups.catchLength', { value: c.length_cm })}</Text> : null}
+                    {c.notes?.trim() ? <Text style={[styles.catchDetailLine, { color: theme.textMuted }]}>{t('groups.catchNotes', { value: c.notes.trim() })}</Text> : null}
                   </View>
                 </View>
               ))
@@ -622,6 +832,11 @@ export default function GroupsScreen() {
                     {m.role === 'owner' ? t('groups.ownerRole') : t('groups.memberRole')}
                   </Text>
                 </View>
+                {canRemoveMember(m) && (
+                  <TouchableOpacity style={[styles.memberRemoveBtn, { backgroundColor: theme.dangerSoft }]} onPress={() => removeGroupMember(m)}>
+                    <Text style={[styles.memberRemoveText, { color: theme.dangerText }]}>{t('groups.removeMember')}</Text>
+                  </TouchableOpacity>
+                )}
               </View>
             ))}
           </ScrollView>
@@ -633,15 +848,15 @@ export default function GroupsScreen() {
       <Modal visible={createModal} transparent animationType="slide">
         <View style={styles.modalOverlay}>
           <View style={[styles.modalCard, { backgroundColor: theme.surface }] }>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>{t('groups.newGroupTitle')}</Text>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>{editingGroup ? t('groups.editGroupTitle') : t('groups.newGroupTitle')}</Text>
             <TextInput style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.inputBg }]} placeholder={t('groups.newGroupName')} placeholderTextColor={theme.textSoft} value={newGroupName} onChangeText={setNewGroupName} />
             <TextInput style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.inputBg }]} placeholder={t('groups.newGroupDescription')} placeholderTextColor={theme.textSoft} value={newGroupDesc} onChangeText={setNewGroupDesc} />
             <View style={styles.modalActions}>
-              <TouchableOpacity style={[styles.cancelBtn, { borderColor: theme.border }]} onPress={() => setCreateModal(false)}>
+              <TouchableOpacity style={[styles.cancelBtn, { borderColor: theme.border }]} onPress={() => { setCreateModal(false); resetGroupEditor(); }}>
                 <Text style={[styles.cancelText, { color: theme.textMuted }]}>{t('common.cancel')}</Text>
               </TouchableOpacity>
               <TouchableOpacity style={[styles.confirmBtn, { backgroundColor: theme.primary }, saving && { opacity: 0.6 }]} onPress={createGroup} disabled={saving}>
-                {saving ? <ActivityIndicator color="#fff" /> : <Text style={styles.confirmText}>{t('groups.create')}</Text>}
+                {saving ? <ActivityIndicator color="#fff" /> : <Text style={styles.confirmText}>{editingGroup ? t('common.update') : t('groups.create')}</Text>}
               </TouchableOpacity>
             </View>
           </View>
@@ -682,6 +897,7 @@ export default function GroupsScreen() {
         details={successState?.details}
         detailsLabel={successState?.detailsLabel}
         copyValue={successState?.copyValue}
+        variant={successState?.variant ?? 'success'}
         onClose={() => setSuccessState(null)}
       />
 
@@ -740,6 +956,7 @@ const styles = StyleSheet.create({
   catchCard: { backgroundColor: '#fff', borderRadius: 12, padding: 12, marginBottom: 8, flexDirection: 'row', alignItems: 'center', gap: 10, borderWidth: 0.5, borderColor: '#eee' },
   catchTitle: { fontSize: 14, fontWeight: '600', color: '#1a1a1a' },
   catchMeta: { fontSize: 12, color: '#888', marginTop: 2 },
+  catchDetailLine: { fontSize: 12, marginTop: 5, lineHeight: 18 },
   statCard: { backgroundColor: '#fff', borderRadius: 12, padding: 12, marginBottom: 8, flexDirection: 'row', alignItems: 'center', gap: 12, borderWidth: 0.5, borderColor: '#eee' },
   memberAvatar: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#1D9E75', alignItems: 'center', justifyContent: 'center' },
   memberName: { fontSize: 14, fontWeight: '700', color: '#1a1a1a' },
@@ -748,6 +965,8 @@ const styles = StyleSheet.create({
   statSub: { fontSize: 11, color: '#888' },
   roleBadge: { backgroundColor: '#f0f0f0', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 },
   roleText: { fontSize: 12, color: '#666', fontWeight: '600' },
+  memberRemoveBtn: { marginLeft: 8, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 9 },
+  memberRemoveText: { fontSize: 12, fontWeight: '800' },
   groupMsgRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 8, marginBottom: 10 },
   groupMsgRowMe: { flexDirection: 'row-reverse' },
   groupMsgBubble: { maxWidth: '78%', borderRadius: 16, padding: 10, borderWidth: 1, borderBottomLeftRadius: 4 },

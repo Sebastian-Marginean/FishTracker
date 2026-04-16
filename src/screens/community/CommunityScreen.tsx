@@ -5,11 +5,12 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
   TextInput, FlatList, ActivityIndicator, Modal,
-  KeyboardAvoidingView, Platform, Alert,
+  KeyboardAvoidingView, Platform, Alert, Image,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import ConfirmActionSheet from '../../components/ConfirmActionSheet';
-import { formatDate, formatTime, useI18n } from '../../i18n';
+import SuccessSheet from '../../components/SuccessSheet';
+import { formatDate, formatDateTime, formatTime, useI18n } from '../../i18n';
 import MessageActionSheet from '../../components/MessageActionSheet';
 import { supabase } from '../../lib/supabase';
 import { useAuthStore } from '../../store/authStore';
@@ -19,6 +20,8 @@ import { getAppTheme } from '../../theme';
 import type { LeaderboardEntry, Message, PrivateMessage, SearchProfileResult } from '../../types';
 
 type Tab = 'chat' | 'private' | 'leaderboard';
+type ModerationKind = 'mute' | 'ban';
+type ModerationDuration = '1h' | '24h' | '7d' | '30d' | 'permanent';
 
 interface ConversationPreview {
   conversationId: string;
@@ -40,9 +43,20 @@ interface PublicProfileSheetState {
 interface PublicProfileDetails extends SearchProfileResult {
   bio?: string | null;
   created_at: string;
+  muted_until?: string | null;
+  mute_permanent?: boolean;
+  banned_until?: string | null;
+  ban_permanent?: boolean;
   catchesCount: number;
   sessionsCount: number;
   groupsCount: number;
+}
+
+interface SuccessState {
+  title: string;
+  message: string;
+  details?: string;
+  variant?: 'success' | 'warning';
 }
 
 export default function CommunityScreen() {
@@ -78,12 +92,76 @@ export default function CommunityScreen() {
   const [publicProfileState, setPublicProfileState] = useState<PublicProfileSheetState | null>(null);
   const [publicProfileDetails, setPublicProfileDetails] = useState<PublicProfileDetails | null>(null);
   const [loadingPublicProfile, setLoadingPublicProfile] = useState(false);
+  const [moderationKind, setModerationKind] = useState<ModerationKind>('ban');
+  const [moderationDuration, setModerationDuration] = useState<ModerationDuration>('7d');
+  const [moderationTarget, setModerationTarget] = useState<PublicProfileDetails | null>(null);
+  const [moderatingProfile, setModeratingProfile] = useState(false);
+  const [successState, setSuccessState] = useState<SuccessState | null>(null);
   const scrollRef = useRef<ScrollView>(null);
   const privateScrollRef = useRef<ScrollView>(null);
   const channelRef = useRef<any>(null);
   const keyboardBehavior = Platform.OS === 'ios' ? 'padding' : 'height';
 
   const canManageMessage = (messageUserId?: string) => !!user?.id && (messageUserId === user.id || isAdmin);
+  const moderationOptions = [
+    { key: '1h' as const, label: t('profile.moderationDuration1h'), ms: 60 * 60 * 1000 },
+    { key: '24h' as const, label: t('profile.moderationDuration24h'), ms: 24 * 60 * 60 * 1000 },
+    { key: '7d' as const, label: t('profile.moderationDuration7d'), ms: 7 * 24 * 60 * 60 * 1000 },
+    { key: '30d' as const, label: t('profile.moderationDuration30d'), ms: 30 * 24 * 60 * 60 * 1000 },
+    { key: 'permanent' as const, label: t('profile.moderationDurationPermanent'), ms: null },
+  ];
+
+  const isProfileModerated = (kind: ModerationKind, item?: Pick<PublicProfileDetails, 'muted_until' | 'mute_permanent' | 'banned_until' | 'ban_permanent'> | null) => {
+    if (!item) return false;
+    if (kind === 'mute') {
+      return !!item.mute_permanent || (!!item.muted_until && new Date(item.muted_until).getTime() > Date.now());
+    }
+    return !!item.ban_permanent || (!!item.banned_until && new Date(item.banned_until).getTime() > Date.now());
+  };
+
+  const getProfileModerationStatus = (kind: ModerationKind, item?: Pick<PublicProfileDetails, 'muted_until' | 'mute_permanent' | 'banned_until' | 'ban_permanent'> | null) => {
+    if (!item || !isProfileModerated(kind, item)) return null;
+    if (kind === 'mute') {
+      if (item.mute_permanent) return t('profile.moderationPermanent');
+      if (!item.muted_until) return null;
+      return t('profile.moderationMutedUntil', { date: formatDateTime(language, item.muted_until) });
+    }
+    if (item.ban_permanent) return t('profile.moderationPermanent');
+    if (!item.banned_until) return null;
+    return t('profile.moderationBannedUntil', { date: formatDateTime(language, item.banned_until) });
+  };
+
+  const resolveMessagingRestrictionState = async (errorMessage?: string): Promise<SuccessState | null> => {
+    const normalizedMessage = errorMessage?.toLowerCase() ?? '';
+    if (!normalizedMessage.includes('row-level security')) return null;
+    if (!user?.id) return null;
+
+    const { data } = await supabase
+      .from('profiles')
+      .select('muted_until, mute_permanent, banned_until, ban_permanent')
+      .eq('id', user.id)
+      .single();
+
+    if (isProfileModerated('mute', data)) {
+      return {
+        title: t('community.messageRestrictedTitle'),
+        message: t('community.messageMutedMessage'),
+        details: getProfileModerationStatus('mute', data) ?? undefined,
+        variant: 'warning',
+      };
+    }
+
+    if (isProfileModerated('ban', data)) {
+      return {
+        title: t('community.messageRestrictedTitle'),
+        message: t('community.messageBannedMessage'),
+        details: getProfileModerationStatus('ban', data) ?? undefined,
+        variant: 'warning',
+      };
+    }
+
+    return null;
+  };
 
   const mergeMessage = (incoming: any) => {
     setMessages((prev) => {
@@ -346,7 +424,7 @@ export default function CommunityScreen() {
     const [profileRes, catchesRes, sessionsRes, groupsRes] = await Promise.all([
       supabase
         .from('profiles')
-        .select('id, username, full_name, avatar_url, bio, created_at')
+        .select('id, username, full_name, avatar_url, bio, created_at, muted_until, mute_permanent, banned_until, ban_permanent')
         .eq('id', targetUser.userId)
         .single(),
       supabase
@@ -394,6 +472,57 @@ export default function CommunityScreen() {
     await openPrivateConversation(profileTarget);
   };
 
+  const applyPublicProfileModeration = async (action: 'set' | 'clear', targetOverride?: PublicProfileDetails | null, kindOverride?: ModerationKind) => {
+    const target = targetOverride ?? moderationTarget;
+    const kind = kindOverride ?? moderationKind;
+    if (!target) return;
+
+    const selectedOption = moderationOptions.find((item) => item.key === moderationDuration);
+    const untilValue = action === 'set' && selectedOption?.ms
+      ? new Date(Date.now() + selectedOption.ms).toISOString()
+      : null;
+
+    const updates = kind === 'mute'
+      ? {
+          mute_permanent: action === 'set' ? moderationDuration === 'permanent' : false,
+          muted_until: action === 'set' ? untilValue : null,
+        }
+      : {
+          ban_permanent: action === 'set' ? moderationDuration === 'permanent' : false,
+          banned_until: action === 'set' ? untilValue : null,
+        };
+
+    setModeratingProfile(true);
+    const { error } = await supabase
+      .from('profiles')
+      .update(updates)
+      .eq('id', target.id);
+    setModeratingProfile(false);
+
+    if (error) {
+      Alert.alert(t('common.error'), error.message);
+      return;
+    }
+
+    const updatedTarget = {
+      ...target,
+      ...updates,
+    };
+    setPublicProfileDetails(updatedTarget);
+    setModerationTarget(null);
+    setSuccessState({
+      title: t('profile.updatedTitle'),
+      message: action === 'set'
+        ? (kind === 'mute'
+            ? t('profile.userMutedMessage', { username: target.username })
+            : t('profile.userBannedMessage', { username: target.username }))
+        : (kind === 'mute'
+            ? t('profile.userUnmutedMessage', { username: target.username })
+            : t('profile.userUnbannedMessage', { username: target.username })),
+      details: action === 'set' ? getProfileModerationStatus(kind, updatedTarget) ?? undefined : undefined,
+    });
+  };
+
   const sendMessage = async () => {
     if (!messageText.trim() || !user) return;
     const content = messageText.trim();
@@ -408,6 +537,11 @@ export default function CommunityScreen() {
 
       if (error) {
         setMessageText(content);
+        const restrictionState = await resolveMessagingRestrictionState(error.message);
+        if (restrictionState) {
+          setSuccessState(restrictionState);
+          return;
+        }
         Alert.alert(t('community.globalEditFailed'), error.message);
         return;
       }
@@ -425,6 +559,11 @@ export default function CommunityScreen() {
 
     if (error) {
       setMessageText(content);
+      const restrictionState = await resolveMessagingRestrictionState(error.message);
+      if (restrictionState) {
+        setSuccessState(restrictionState);
+        return;
+      }
       Alert.alert(t('community.globalSendFailed'), error.message);
       return;
     }
@@ -446,6 +585,11 @@ export default function CommunityScreen() {
 
       if (error) {
         setPrivateMessageText(content);
+        const restrictionState = await resolveMessagingRestrictionState(error.message);
+        if (restrictionState) {
+          setSuccessState(restrictionState);
+          return;
+        }
         Alert.alert(t('community.privateEditFailed'), error.message);
         return;
       }
@@ -465,6 +609,11 @@ export default function CommunityScreen() {
 
     if (error) {
       setPrivateMessageText(content);
+      const restrictionState = await resolveMessagingRestrictionState(error.message);
+      if (restrictionState) {
+        setSuccessState(restrictionState);
+        return;
+      }
       Alert.alert(t('community.privateSendFailed'), error.message);
       return;
     }
@@ -879,9 +1028,13 @@ export default function CommunityScreen() {
             ) : publicProfileDetails ? (
               <>
                 <View style={styles.profileHeaderRow}>
-                  <View style={[styles.profileAvatarLarge, { backgroundColor: theme.primary }]}> 
-                    <Text style={styles.profileAvatarLargeText}>{publicProfileDetails.username?.[0]?.toUpperCase() ?? '?'}</Text>
-                  </View>
+                  {publicProfileDetails.avatar_url ? (
+                    <Image source={{ uri: publicProfileDetails.avatar_url }} style={styles.profileAvatarLarge} />
+                  ) : (
+                    <View style={[styles.profileAvatarLarge, { backgroundColor: theme.primary }]}> 
+                      <Text style={styles.profileAvatarLargeText}>{publicProfileDetails.username?.[0]?.toUpperCase() ?? '?'}</Text>
+                    </View>
+                  )}
                   <View style={{ flex: 1 }}>
                     <Text style={[styles.profileUsername, { color: theme.text }]}>@{publicProfileDetails.username}</Text>
                     <Text style={[styles.profileFullName, { color: theme.textMuted }]}>{publicProfileDetails.full_name?.trim() || t('community.profileNoName')}</Text>
@@ -917,11 +1070,88 @@ export default function CommunityScreen() {
                     <Text style={styles.profilePrimaryButtonText}>{t('community.profileSendMessage')}</Text>
                   </TouchableOpacity>
                 </View>
+                {isAdmin && (
+                  <View style={styles.profileActionsRow}>
+                    <TouchableOpacity
+                      style={[styles.profileSecondaryButton, { backgroundColor: isProfileModerated('mute', publicProfileDetails) ? theme.surfaceAlt : theme.primarySoft, borderColor: isProfileModerated('mute', publicProfileDetails) ? theme.border : theme.primary }]}
+                      onPress={() => {
+                        if (isProfileModerated('mute', publicProfileDetails)) {
+                          void applyPublicProfileModeration('clear', publicProfileDetails, 'mute');
+                          return;
+                        }
+                        setModerationKind('mute');
+                        setModerationDuration('24h');
+                        setModerationTarget(publicProfileDetails);
+                      }}
+                    >
+                      <Text style={[styles.profileSecondaryButtonText, { color: isProfileModerated('mute', publicProfileDetails) ? theme.text : (isDark ? '#dcfff3' : theme.primaryStrong) }]}>{isProfileModerated('mute', publicProfileDetails) ? t('profile.unmuteUser') : t('profile.muteUser')}</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.profileSecondaryButton, { backgroundColor: isProfileModerated('ban', publicProfileDetails) ? theme.surfaceAlt : theme.dangerSoft, borderColor: isProfileModerated('ban', publicProfileDetails) ? theme.border : theme.dangerText }]}
+                      onPress={() => {
+                        if (isProfileModerated('ban', publicProfileDetails)) {
+                          void applyPublicProfileModeration('clear', publicProfileDetails, 'ban');
+                          return;
+                        }
+                        setModerationKind('ban');
+                        setModerationDuration('7d');
+                        setModerationTarget(publicProfileDetails);
+                      }}
+                    >
+                      <Text style={[styles.profileSecondaryButtonText, { color: isProfileModerated('ban', publicProfileDetails) ? theme.text : theme.dangerText }]}>{isProfileModerated('ban', publicProfileDetails) ? t('profile.unbanUser') : t('profile.banUser')}</Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
+                {isAdmin && getProfileModerationStatus('mute', publicProfileDetails) ? (
+                  <Text style={[styles.profileAdminHint, { color: theme.primary }]}>{getProfileModerationStatus('mute', publicProfileDetails)}</Text>
+                ) : null}
+                {isAdmin && getProfileModerationStatus('ban', publicProfileDetails) ? (
+                  <Text style={[styles.profileAdminHint, { color: theme.dangerText }]}>{getProfileModerationStatus('ban', publicProfileDetails)}</Text>
+                ) : null}
               </>
             ) : null}
           </View>
         </View>
       </Modal>
+
+      <Modal visible={!!moderationTarget && !isProfileModerated(moderationKind, moderationTarget)} transparent animationType="slide" onRequestClose={() => setModerationTarget(null)}>
+        <View style={styles.profileOverlay}>
+          <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={() => setModerationTarget(null)} />
+          <View style={[styles.profileCard, { backgroundColor: theme.surface }]}> 
+            <View style={[styles.profileHandle, { backgroundColor: isDark ? theme.border : '#D6DEE3' }]} />
+            <Text style={[styles.profileUsername, { color: theme.text, fontSize: 18 }]}>{t('profile.moderationTitle')}</Text>
+            <Text style={[styles.profileFullName, { color: theme.textMuted }]}>{moderationTarget ? `@${moderationTarget.username} · ${t('profile.moderationSubtitle')}` : t('profile.moderationSubtitle')}</Text>
+            <View style={styles.profileModerationChips}>
+              {moderationOptions.map((option) => (
+                <TouchableOpacity
+                  key={option.key}
+                  style={[styles.profileModerationChip, { backgroundColor: moderationDuration === option.key ? (moderationKind === 'ban' ? theme.dangerText : theme.primary) : theme.surfaceAlt }]}
+                  onPress={() => setModerationDuration(option.key)}
+                >
+                  <Text style={[styles.profileModerationChipText, { color: moderationDuration === option.key ? '#fff' : theme.text }]}>{option.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <View style={styles.profileActionsRow}>
+              <TouchableOpacity style={[styles.profileSecondaryButton, { backgroundColor: theme.surfaceAlt, borderColor: theme.border }]} onPress={() => setModerationTarget(null)}>
+                <Text style={[styles.profileSecondaryButtonText, { color: theme.text }]}>{t('common.cancel')}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.profilePrimaryButton, { backgroundColor: moderationKind === 'ban' ? theme.dangerText : theme.primary }, moderatingProfile && { opacity: 0.7 }]} onPress={() => void applyPublicProfileModeration('set')} disabled={moderatingProfile}>
+                {moderatingProfile ? <ActivityIndicator color="#fff" /> : <Text style={styles.profilePrimaryButtonText}>{t('profile.moderationApply')}</Text>}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <SuccessSheet
+        visible={!!successState}
+        title={successState?.title ?? ''}
+        message={successState?.message ?? ''}
+        details={successState?.details}
+        variant={successState?.variant ?? 'success'}
+        onClose={() => setSuccessState(null)}
+      />
     </SafeAreaView>
   );
 }
@@ -1060,6 +1290,10 @@ const styles = StyleSheet.create({
   profileStatValue: { fontSize: 22, fontWeight: '900' },
   profileStatLabel: { fontSize: 11, marginTop: 4, textAlign: 'center' },
   profileActionsRow: { flexDirection: 'row', gap: 10, marginTop: 18 },
+  profileAdminHint: { fontSize: 12, fontWeight: '700', marginTop: 12, textAlign: 'center' },
+  profileModerationChips: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 18 },
+  profileModerationChip: { borderRadius: 999, paddingHorizontal: 14, paddingVertical: 10 },
+  profileModerationChipText: { fontSize: 12, fontWeight: '800' },
   profileSecondaryButton: {
     flex: 1,
     borderWidth: 1,

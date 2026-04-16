@@ -22,6 +22,12 @@ create table if not exists public.profiles (
 alter table public.profiles
   add column if not exists role text not null default 'user';
 
+alter table public.profiles
+  add column if not exists muted_until timestamptz,
+  add column if not exists mute_permanent boolean not null default false,
+  add column if not exists banned_until timestamptz,
+  add column if not exists ban_permanent boolean not null default false;
+
 do $$
 begin
   if not exists (
@@ -35,6 +41,63 @@ begin
 end
 $$;
 
+create or replace function public.normalize_username(value text)
+returns text
+language sql
+immutable
+returns null on null input
+set search_path = public
+as $$
+  select regexp_replace(trim(value), '\\s+', ' ', 'g');
+$$;
+
+create or replace function public.ensure_unique_profile_username()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+begin
+  new.username := public.normalize_username(new.username);
+
+  if new.username is null or char_length(new.username) < 3 then
+    raise exception 'username must be at least 3 characters long';
+  end if;
+
+  if exists (
+    select 1
+    from public.profiles p
+    where lower(public.normalize_username(p.username)) = lower(new.username)
+      and (tg_op = 'INSERT' or p.id <> new.id)
+  ) then
+    raise exception 'username already exists';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_profiles_unique_username on public.profiles;
+create trigger trg_profiles_unique_username
+  before insert or update of username on public.profiles
+  for each row execute function public.ensure_unique_profile_username();
+
+create or replace function public.find_profile_by_username(lookup_username text)
+returns table (
+  id uuid,
+  username text
+)
+language sql
+security definer
+set search_path = public
+as $$
+  select
+    p.id,
+    p.username
+  from public.profiles p
+  where lower(public.normalize_username(p.username)) = lower(public.normalize_username(lookup_username))
+  limit 1;
+$$;
+
 -- Creare automată profil la înregistrare
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer as $$
@@ -42,7 +105,7 @@ begin
   insert into public.profiles (id, username, full_name)
   values (
     new.id,
-    coalesce(new.raw_user_meta_data->>'username', split_part(new.email, '@', 1)),
+    public.normalize_username(coalesce(new.raw_user_meta_data->>'username', split_part(new.email, '@', 1))),
     coalesce(new.raw_user_meta_data->>'full_name', '')
   );
   return new;
@@ -97,6 +160,50 @@ as $$
 $$;
 
 -- ============================================================
+-- SIGNUP VERIFICATION CODES (confirmare cont prin cod)
+-- ============================================================
+create table if not exists public.signup_verification_codes (
+  id            uuid default uuid_generate_v4() primary key,
+  user_id       uuid references auth.users(id) on delete cascade not null,
+  email         text not null,
+  code_hash     text not null,
+  expires_at    timestamptz not null,
+  used_at       timestamptz,
+  attempt_count int not null default 0,
+  created_at    timestamptz default now()
+);
+
+create index if not exists idx_signup_verification_codes_user_created_at
+  on public.signup_verification_codes (user_id, created_at desc);
+
+create index if not exists idx_signup_verification_codes_email_created_at
+  on public.signup_verification_codes (email, created_at desc);
+
+create or replace function public.find_user_for_signup_confirmation(lookup_email text)
+returns table (
+  user_id uuid,
+  email text,
+  username text,
+  full_name text,
+  email_confirmed_at timestamptz
+)
+language sql
+security definer
+set search_path = public, auth
+as $$
+  select
+    u.id as user_id,
+    u.email::text as email,
+    p.username,
+    p.full_name,
+    u.email_confirmed_at
+  from auth.users u
+  left join public.profiles p on p.id = u.id
+  where lower(u.email::text) = lower(trim(lookup_email))
+  limit 1;
+$$;
+
+-- ============================================================
 -- BAIT PRESETS (momeli predefinite — readonly)
 -- ============================================================
 create table if not exists public.bait_presets (
@@ -135,6 +242,7 @@ create table if not exists public.locations (
   id           uuid default uuid_generate_v4() primary key,
   created_by   uuid references public.profiles(id) on delete set null,
   name         text not null,
+  water_type   text not null default 'lake' check (water_type in ('lake', 'pond', 'river', 'danube', 'canal', 'other')),
   description  text,
   lat          double precision not null,
   lng          double precision not null,
@@ -142,6 +250,48 @@ create table if not exists public.locations (
   is_public    boolean default true,
   created_at   timestamptz default now()
 );
+
+alter table public.locations
+  add column if not exists water_type text not null default 'lake';
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'locations_water_type_check'
+  ) then
+    alter table public.locations
+      add constraint locations_water_type_check check (water_type in ('lake', 'pond', 'river', 'danube', 'canal', 'other'));
+  end if;
+end
+$$;
+
+create or replace function public.ensure_unique_location_name()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+begin
+  new.name := regexp_replace(trim(new.name), '\\s+', ' ', 'g');
+
+  if exists (
+    select 1
+    from public.locations l
+    where lower(regexp_replace(trim(l.name), '\\s+', ' ', 'g')) = lower(new.name)
+      and (tg_op = 'INSERT' or l.id <> new.id)
+  ) then
+    raise exception 'location name already exists';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_locations_unique_name on public.locations;
+create trigger trg_locations_unique_name
+  before insert or update of name on public.locations
+  for each row execute function public.ensure_unique_location_name();
 
 -- ============================================================
 -- SESSIONS (partide de pescuit)
@@ -163,7 +313,7 @@ create table if not exists public.sessions (
 create table if not exists public.rods (
   id             uuid default uuid_generate_v4() primary key,
   session_id     uuid references public.sessions(id) on delete cascade not null,
-  rod_number     int not null check (rod_number between 1 and 4),
+  rod_number     int not null check (rod_number between 1 and 10),
   bait_preset_id int references public.bait_presets(id) on delete set null,
   bait_custom    text,            -- dacă nu e din preseturi
   hook_setup     text,            -- montură / cârlig
@@ -175,6 +325,12 @@ create table if not exists public.rods (
   unique (session_id, rod_number)
 );
 
+alter table public.rods
+  drop constraint if exists rods_rod_number_check;
+
+alter table public.rods
+  add constraint rods_rod_number_check check (rod_number between 1 and 10);
+
 -- ============================================================
 -- ROD SETUP HISTORY (istoric nada / montura per lanseta)
 -- ============================================================
@@ -183,11 +339,17 @@ create table if not exists public.rod_setup_history (
   session_id  uuid references public.sessions(id) on delete cascade not null,
   rod_id      uuid references public.rods(id) on delete set null,
   user_id     uuid references public.profiles(id) on delete cascade not null,
-  rod_number  int not null check (rod_number between 1 and 4),
+  rod_number  int not null check (rod_number between 1 and 10),
   bait_name   text,
   hook_setup  text,
   created_at  timestamptz default now()
 );
+
+alter table public.rod_setup_history
+  drop constraint if exists rod_setup_history_rod_number_check;
+
+alter table public.rod_setup_history
+  add constraint rod_setup_history_rod_number_check check (rod_number between 1 and 10);
 
 -- ============================================================
 -- CATCHES (capturi)
@@ -326,6 +488,7 @@ create table if not exists public.group_messages (
 
 alter table public.profiles      enable row level security;
 alter table public.password_reset_codes enable row level security;
+alter table public.signup_verification_codes enable row level security;
 alter table public.locations     enable row level security;
 alter table public.sessions      enable row level security;
 alter table public.rods          enable row level security;
@@ -376,6 +539,40 @@ as $$
     select 1
     from public.private_conversation_members pcm
     where pcm.conversation_id = check_conversation_id and pcm.user_id = check_user_id
+  );
+$$;
+
+create or replace function public.is_user_muted(check_user_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.profiles p
+    where p.id = check_user_id
+      and (
+        p.mute_permanent = true
+        or (p.muted_until is not null and p.muted_until > now())
+      )
+  );
+$$;
+
+create or replace function public.is_user_banned(check_user_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.profiles p
+    where p.id = check_user_id
+      and (
+        p.ban_permanent = true
+        or (p.banned_until is not null and p.banned_until > now())
+      )
   );
 $$;
 
@@ -465,12 +662,20 @@ $$;
 grant execute on function public.is_admin(uuid) to authenticated;
 grant execute on function public.is_group_member(uuid, uuid) to authenticated;
 grant execute on function public.is_private_conversation_member(uuid, uuid) to authenticated;
+grant execute on function public.is_user_muted(uuid) to authenticated;
+grant execute on function public.is_user_banned(uuid) to authenticated;
 grant execute on function public.create_or_get_private_conversation(uuid) to authenticated;
 grant execute on function public.get_group_by_invite_code(text) to authenticated;
+grant execute on function public.find_profile_by_username(text) to authenticated;
+grant execute on function public.find_profile_by_username(text) to service_role;
 revoke all on function public.find_user_for_password_reset(text) from public;
 revoke all on function public.find_user_for_password_reset(text) from anon;
 revoke all on function public.find_user_for_password_reset(text) from authenticated;
 grant execute on function public.find_user_for_password_reset(text) to service_role;
+revoke all on function public.find_user_for_signup_confirmation(text) from public;
+revoke all on function public.find_user_for_signup_confirmation(text) from anon;
+revoke all on function public.find_user_for_signup_confirmation(text) from authenticated;
+grant execute on function public.find_user_for_signup_confirmation(text) to service_role;
 
 create or replace function public.get_leaderboard_monthly()
 returns table (
@@ -513,24 +718,59 @@ create policy "Users update own profile" on public.profiles for update using (
   auth.uid() = id or public.is_admin(auth.uid())
 );
 
+insert into storage.buckets (id, name, public)
+values ('photos', 'photos', true)
+on conflict (id) do update set public = excluded.public;
+
+insert into storage.buckets (id, name, public)
+values ('avatars', 'avatars', true)
+on conflict (id) do update set public = excluded.public;
+
+drop policy if exists "Public read app images" on storage.objects;
+create policy "Public read app images" on storage.objects for select using (
+  bucket_id in ('photos', 'avatars')
+);
+
+drop policy if exists "Authenticated upload app images" on storage.objects;
+create policy "Authenticated upload app images" on storage.objects for insert with check (
+  auth.role() = 'authenticated' and bucket_id in ('photos', 'avatars')
+);
+
+drop policy if exists "Authenticated update app images" on storage.objects;
+create policy "Authenticated update app images" on storage.objects for update using (
+  auth.role() = 'authenticated' and bucket_id in ('photos', 'avatars')
+) with check (
+  auth.role() = 'authenticated' and bucket_id in ('photos', 'avatars')
+);
+
+drop policy if exists "Authenticated delete app images" on storage.objects;
+create policy "Authenticated delete app images" on storage.objects for delete using (
+  auth.role() = 'authenticated' and bucket_id in ('photos', 'avatars')
+);
+
 -- Locations: publice vizibile de toți, creare autentificați
 drop policy if exists "Public locations viewable" on public.locations;
 create policy "Public locations viewable" on public.locations for select using (
   is_public = true or auth.uid() = created_by or public.is_admin(auth.uid())
 );
 drop policy if exists "Authenticated users create locations" on public.locations;
-create policy "Authenticated users create locations" on public.locations for insert with check (
-  auth.uid() = created_by or public.is_admin(auth.uid())
+drop policy if exists "Admins create locations" on public.locations;
+create policy "Admins create locations" on public.locations for insert with check (
+  public.is_admin(auth.uid())
+  and auth.uid() = created_by
+  and not public.is_user_banned(auth.uid())
 );
 drop policy if exists "Owners or admins update locations" on public.locations;
 create policy "Owners or admins update locations" on public.locations for update using (
   auth.uid() = created_by or public.is_admin(auth.uid())
 ) with check (
-  auth.uid() = created_by or public.is_admin(auth.uid())
+  (auth.uid() = created_by or public.is_admin(auth.uid()))
+  and not public.is_user_banned(auth.uid())
 );
 drop policy if exists "Owners or admins delete locations" on public.locations;
 create policy "Owners or admins delete locations" on public.locations for delete using (
-  auth.uid() = created_by or public.is_admin(auth.uid())
+  (auth.uid() = created_by or public.is_admin(auth.uid()))
+  and not public.is_user_banned(auth.uid())
 );
 
 -- Sessions: doar propriile sesiuni
@@ -538,7 +778,8 @@ drop policy if exists "Own sessions only" on public.sessions;
 create policy "Own sessions only" on public.sessions for all using (
   auth.uid() = user_id or public.is_admin(auth.uid())
 ) with check (
-  auth.uid() = user_id or public.is_admin(auth.uid())
+  (auth.uid() = user_id or public.is_admin(auth.uid()))
+  and not public.is_user_banned(auth.uid())
 );
 
 -- Rods: prin sesiunile proprii
@@ -547,8 +788,11 @@ create policy "Own rods via session" on public.rods for all using (
   public.is_admin(auth.uid())
   or exists (select 1 from public.sessions s where s.id = rods.session_id and s.user_id = auth.uid())
 ) with check (
-  public.is_admin(auth.uid())
-  or exists (select 1 from public.sessions s where s.id = rods.session_id and s.user_id = auth.uid())
+  (
+    public.is_admin(auth.uid())
+    or exists (select 1 from public.sessions s where s.id = rods.session_id and s.user_id = auth.uid())
+  )
+  and not public.is_user_banned(auth.uid())
 );
 
 -- Rod setup history: doar propriul istoric sau admin
@@ -558,7 +802,8 @@ create policy "Own rod setup history" on public.rod_setup_history for select usi
 );
 drop policy if exists "Users insert own rod setup history" on public.rod_setup_history;
 create policy "Users insert own rod setup history" on public.rod_setup_history for insert with check (
-  auth.uid() = user_id or public.is_admin(auth.uid())
+  (auth.uid() = user_id or public.is_admin(auth.uid()))
+  and not public.is_user_banned(auth.uid())
 );
 
 -- Catches: proprii + publice per locație
@@ -566,7 +811,8 @@ drop policy if exists "Own catches" on public.catches;
 create policy "Own catches" on public.catches for all using (
   auth.uid() = user_id or public.is_admin(auth.uid())
 ) with check (
-  auth.uid() = user_id or public.is_admin(auth.uid())
+  (auth.uid() = user_id or public.is_admin(auth.uid()))
+  and not public.is_user_banned(auth.uid())
 );
 drop policy if exists "Public catches on public locations" on public.catches;
 create policy "Public catches on public locations" on public.catches for select using (
@@ -595,16 +841,20 @@ create policy "Group members view group" on public.groups for select using (
   or owner_id = auth.uid()
 );
 drop policy if exists "Create groups" on public.groups;
-create policy "Create groups" on public.groups for insert with check (auth.uid() = owner_id);
+create policy "Create groups" on public.groups for insert with check (
+  auth.uid() = owner_id and not public.is_user_banned(auth.uid())
+);
 drop policy if exists "Owners or admins update groups" on public.groups;
 create policy "Owners or admins update groups" on public.groups for update using (
   owner_id = auth.uid() or public.is_admin(auth.uid())
 ) with check (
-  owner_id = auth.uid() or public.is_admin(auth.uid())
+  (owner_id = auth.uid() or public.is_admin(auth.uid()))
+  and not public.is_user_banned(auth.uid())
 );
 drop policy if exists "Owners or admins delete groups" on public.groups;
 create policy "Owners or admins delete groups" on public.groups for delete using (
-  owner_id = auth.uid() or public.is_admin(auth.uid())
+  (owner_id = auth.uid() or public.is_admin(auth.uid()))
+  and not public.is_user_banned(auth.uid())
 );
 
 -- Group members
@@ -620,21 +870,27 @@ create policy "Members view group_members" on public.group_members for select us
   or public.is_group_member(group_members.group_id, auth.uid())
 );
 drop policy if exists "Join groups" on public.group_members;
-create policy "Join groups" on public.group_members for insert with check (auth.uid() = user_id);
+create policy "Join groups" on public.group_members for insert with check (
+  auth.uid() = user_id and not public.is_user_banned(auth.uid())
+);
 drop policy if exists "Members update own group membership state" on public.group_members;
 create policy "Members update own group membership state" on public.group_members for update using (
   public.is_admin(auth.uid()) or auth.uid() = user_id
 ) with check (
-  public.is_admin(auth.uid()) or auth.uid() = user_id
+  (public.is_admin(auth.uid()) or auth.uid() = user_id)
+  and not public.is_user_banned(auth.uid())
 );
 drop policy if exists "Owners or admins remove group members" on public.group_members;
 create policy "Owners or admins remove group members" on public.group_members for delete using (
-  public.is_admin(auth.uid())
-  or exists (
-    select 1 from public.groups g
-    where g.id = group_members.group_id and g.owner_id = auth.uid()
+  (
+    public.is_admin(auth.uid())
+    or exists (
+      select 1 from public.groups g
+      where g.id = group_members.group_id and g.owner_id = auth.uid()
+    )
+    or auth.uid() = user_id
   )
-  or auth.uid() = user_id
+  and not public.is_user_banned(auth.uid())
 );
 
 -- Group photos
@@ -675,12 +931,18 @@ create policy "Owners or admins delete photos" on public.group_photos for delete
 drop policy if exists "Authenticated view messages" on public.messages;
 create policy "Authenticated view messages" on public.messages for select using (auth.role() = 'authenticated');
 drop policy if exists "Authenticated send messages" on public.messages;
-create policy "Authenticated send messages" on public.messages for insert with check (auth.uid() = user_id);
+create policy "Authenticated send messages" on public.messages for insert with check (
+  auth.uid() = user_id
+  and not public.is_user_banned(auth.uid())
+  and not public.is_user_muted(auth.uid())
+);
 drop policy if exists "Owners or admins update messages" on public.messages;
 create policy "Owners or admins update messages" on public.messages for update using (
   auth.uid() = user_id or public.is_admin(auth.uid())
 ) with check (
-  auth.uid() = user_id or public.is_admin(auth.uid())
+  (auth.uid() = user_id or public.is_admin(auth.uid()))
+  and not public.is_user_banned(auth.uid())
+  and not public.is_user_muted(auth.uid())
 );
 drop policy if exists "Owners or admins delete messages" on public.messages;
 create policy "Owners or admins delete messages" on public.messages for delete using (
@@ -717,13 +979,17 @@ drop policy if exists "Members send private messages" on public.private_messages
 create policy "Members send private messages" on public.private_messages for insert with check (
   auth.uid() = user_id
   and public.is_private_conversation_member(private_messages.conversation_id, auth.uid())
+  and not public.is_user_banned(auth.uid())
+  and not public.is_user_muted(auth.uid())
 );
 
 drop policy if exists "Owners or admins update private messages" on public.private_messages;
 create policy "Owners or admins update private messages" on public.private_messages for update using (
   auth.uid() = user_id or public.is_admin(auth.uid())
 ) with check (
-  auth.uid() = user_id or public.is_admin(auth.uid())
+  (auth.uid() = user_id or public.is_admin(auth.uid()))
+  and not public.is_user_banned(auth.uid())
+  and not public.is_user_muted(auth.uid())
 );
 
 drop policy if exists "Owners or admins delete private messages" on public.private_messages;
@@ -751,13 +1017,17 @@ create policy "Members send group messages" on public.group_messages for insert 
       select 1 from public.groups g where g.id = group_messages.group_id and g.owner_id = auth.uid()
     )
   )
+  and not public.is_user_banned(auth.uid())
+  and not public.is_user_muted(auth.uid())
 );
 
 drop policy if exists "Owners or admins update group messages" on public.group_messages;
 create policy "Owners or admins update group messages" on public.group_messages for update using (
   auth.uid() = user_id or public.is_admin(auth.uid())
 ) with check (
-  auth.uid() = user_id or public.is_admin(auth.uid())
+  (auth.uid() = user_id or public.is_admin(auth.uid()))
+  and not public.is_user_banned(auth.uid())
+  and not public.is_user_muted(auth.uid())
 );
 
 drop policy if exists "Owners or admins delete group messages" on public.group_messages;

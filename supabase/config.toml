@@ -3,3 +3,9 @@ verify_jwt = false
 
 [functions.confirm-password-reset]
 verify_jwt = false
+
+[functions.request-sign-up]
+verify_jwt = false
+
+[functions.confirm-sign-up]
+verify_jwt = false

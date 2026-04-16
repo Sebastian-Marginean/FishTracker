@@ -47,28 +47,22 @@ Deno.serve(async (request) => {
 
   let email = '';
   let code = '';
-  let password = '';
 
   try {
     const body = await request.json();
     email = String(body?.email ?? '').trim().toLowerCase();
     code = String(body?.code ?? '').trim();
-    password = String(body?.password ?? '');
   } catch {
     return jsonResponse({ error: 'Invalid request body' }, 400);
   }
 
-  if (!email || !code || !password) {
-    return jsonResponse({ error: 'Email, code and password are required' }, 400);
+  if (!email || !code) {
+    return jsonResponse({ error: 'Email and code are required' }, 400);
   }
 
-  if (password.length < 8) {
-    return jsonResponse({ error: 'Password must be at least 8 characters long' }, 400);
-  }
-
-  const { data: userRows, error: userError } = await supabase.rpc('find_user_for_password_reset', { lookup_email: email });
+  const { data: userRows, error: userError } = await supabase.rpc('find_user_for_signup_confirmation', { lookup_email: email });
   if (userError) {
-    return jsonResponse({ error: `Could not validate reset request: ${userError.message}` }, 500);
+    return jsonResponse({ error: `Could not validate the account: ${userError.message}` }, 500);
   }
 
   const user = Array.isArray(userRows) ? userRows[0] : userRows;
@@ -76,12 +70,16 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: 'Invalid or expired code' }, 400);
   }
 
+  if (user.email_confirmed_at) {
+    return jsonResponse({ success: true });
+  }
+
   const codeHash = await sha256(code);
   const nowIso = new Date().toISOString();
 
   const { data: matchingCodes, error: codeError } = await supabase
-    .from('password_reset_codes')
-    .select('id, expires_at, used_at')
+    .from('signup_verification_codes')
+    .select('id')
     .eq('user_id', user.user_id)
     .eq('email', email)
     .eq('code_hash', codeHash)
@@ -91,7 +89,7 @@ Deno.serve(async (request) => {
     .limit(1);
 
   if (codeError) {
-    return jsonResponse({ error: `Could not validate code: ${codeError.message}` }, 500);
+    return jsonResponse({ error: `Could not validate the code: ${codeError.message}` }, 500);
   }
 
   const matchingCode = matchingCodes?.[0];
@@ -100,17 +98,16 @@ Deno.serve(async (request) => {
   }
 
   const { error: markUsedError } = await supabase
-    .from('password_reset_codes')
+    .from('signup_verification_codes')
     .update({ used_at: nowIso })
     .eq('id', matchingCode.id)
     .is('used_at', null);
 
   if (markUsedError) {
-    return jsonResponse({ error: `Could not consume code: ${markUsedError.message}` }, 500);
+    return jsonResponse({ error: `Could not consume the code: ${markUsedError.message}` }, 500);
   }
 
   const { error: updateError } = await supabase.auth.admin.updateUserById(user.user_id, {
-    password,
     email_confirm: true,
   });
 
@@ -119,7 +116,7 @@ Deno.serve(async (request) => {
   }
 
   await supabase
-    .from('password_reset_codes')
+    .from('signup_verification_codes')
     .update({ used_at: nowIso })
     .eq('user_id', user.user_id)
     .is('used_at', null);

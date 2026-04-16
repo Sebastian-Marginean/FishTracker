@@ -94,6 +94,12 @@ export const removePendingCatch = async (tempId: string): Promise<void> => {
   await AsyncStorage.setItem(KEYS.PENDING_CATCHES, JSON.stringify(filtered));
 };
 
+export const removePendingCatchesForRod = async (sessionId: string | null, rodNumber: number): Promise<void> => {
+  const existing = await loadPendingCatches();
+  const filtered = existing.filter((catchItem) => !(catchItem.sessionId === sessionId && catchItem.rodNumber === rodNumber));
+  await AsyncStorage.setItem(KEYS.PENDING_CATCHES, JSON.stringify(filtered));
+};
+
 export const clearPendingCatches = async (): Promise<void> => {
   await AsyncStorage.removeItem(KEYS.PENDING_CATCHES);
 };

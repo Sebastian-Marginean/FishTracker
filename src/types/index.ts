@@ -8,6 +8,10 @@ export interface Profile {
   avatar_url?: string;
   bio?: string;
   role: 'user' | 'admin';
+  muted_until?: string | null;
+  mute_permanent?: boolean;
+  banned_until?: string | null;
+  ban_permanent?: boolean;
   created_at: string;
 }
 
@@ -21,6 +25,7 @@ export interface Location {
   id: string;
   created_by?: string;
   name: string;
+  water_type: 'lake' | 'pond' | 'river' | 'danube' | 'canal' | 'other';
   description?: string;
   lat: number;
   lng: number;
@@ -38,6 +43,8 @@ export interface WeatherSnapshot {
   icon: string;
 }
 
+export type RodNumber = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
+
 export interface Session {
   id: string;
   user_id: string;
@@ -54,7 +61,7 @@ export interface Session {
 export interface Rod {
   id: string;
   session_id: string;
-  rod_number: 1 | 2 | 3 | 4;
+  rod_number: RodNumber;
   bait_preset_id?: number;
   bait_custom?: string;
   hook_setup?: string;
@@ -175,7 +182,7 @@ export interface LeaderboardEntry {
 
 // Starea locală a unei lansete (offline-first)
 export interface LocalRodState {
-  rodNumber: 1 | 2 | 3 | 4;
+  rodNumber: RodNumber;
   baitName: string;
   hookSetup: string;
   castCount: number;

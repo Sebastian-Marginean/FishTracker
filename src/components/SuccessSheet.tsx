@@ -13,6 +13,7 @@ interface SuccessSheetProps {
   copyValue?: string;
   buttonLabel?: string;
   autoCloseMs?: number;
+  variant?: 'success' | 'warning';
   onClose: () => void;
 }
 
@@ -25,15 +26,38 @@ export default function SuccessSheet({
   copyValue,
   buttonLabel = 'Perfect',
   autoCloseMs = 7000,
+  variant = 'success',
   onClose,
 }: SuccessSheetProps) {
   const mode = useThemeStore((state) => state.mode);
   const { t } = useI18n();
   const theme = getAppTheme(mode);
   const isDark = mode === 'dark';
+  const isWarning = variant === 'warning';
   const [copied, setCopied] = useState(false);
   const [remainingSeconds, setRemainingSeconds] = useState(Math.ceil(autoCloseMs / 1000));
   const onCloseRef = useRef(onClose);
+
+  const badgeOuterColor = isWarning
+    ? (isDark ? '#4A3518' : '#FFF0D6')
+    : (isDark ? theme.primarySoft : '#DDF7EC');
+  const badgeInnerColor = isWarning
+    ? '#D28A1F'
+    : theme.primary;
+  const accentColor = isWarning
+    ? '#7A4E0E'
+    : (isDark ? theme.primary : theme.primaryStrong);
+  const detailBackgroundColor = isWarning
+    ? (isDark ? '#2B2418' : '#FFF8EA')
+    : (isDark ? theme.surfaceAlt : '#F4FBF8');
+  const detailBorderColor = isWarning
+    ? (isDark ? '#58472B' : '#F3D8A4')
+    : (isDark ? theme.border : '#D7EEE5');
+  const detailTextColor = isWarning
+    ? (isDark ? '#FFD897' : '#8A560A')
+    : (isDark ? theme.text : '#0E6B52');
+  const eyebrowText = isWarning ? t('sheet.warningEyebrow') : t('sheet.successEyebrow');
+  const badgeIconText = isWarning ? '!' : '✓';
 
   useEffect(() => {
     onCloseRef.current = onClose;
@@ -75,36 +99,36 @@ export default function SuccessSheet({
       <View style={styles.overlay}>
         <View style={[styles.card, { backgroundColor: theme.surface }]}>
           <View style={styles.badgeWrap}>
-            <View style={[styles.badgeOuter, { backgroundColor: isDark ? theme.primarySoft : '#DDF7EC' }]}>
-              <View style={[styles.badgeInner, { backgroundColor: theme.primary }]}>
-                <Text style={styles.badgeIcon}>✓</Text>
+            <View style={[styles.badgeOuter, { backgroundColor: badgeOuterColor }]}>
+              <View style={[styles.badgeInner, { backgroundColor: badgeInnerColor }]}>
+                <Text style={styles.badgeIcon}>{badgeIconText}</Text>
               </View>
             </View>
           </View>
 
-          <Text style={[styles.eyebrow, { color: isDark ? theme.textMuted : '#679a8c' }]}>{t('sheet.successEyebrow')}</Text>
+          <Text style={[styles.eyebrow, { color: isWarning ? accentColor : (isDark ? theme.textMuted : '#679a8c') }]}>{eyebrowText}</Text>
           <Text style={[styles.title, { color: theme.text }]}>{title}</Text>
           <Text style={[styles.message, { color: theme.textMuted }]}>{message}</Text>
 
           {details ? (
-            <View style={[styles.detailsBox, { backgroundColor: isDark ? theme.surfaceAlt : '#F4FBF8', borderColor: isDark ? theme.border : '#D7EEE5' }]}>
+            <View style={[styles.detailsBox, { backgroundColor: detailBackgroundColor, borderColor: detailBorderColor }]}>
               {detailsLabel ? <Text style={[styles.detailsLabel, { color: theme.textMuted }]}>{detailsLabel}</Text> : null}
               {copyValue ? (
                 <View style={styles.detailsRow}>
-                  <Text style={[styles.detailsCode, { color: isDark ? theme.text : '#0E6B52' }]}>{details}</Text>
-                  <TouchableOpacity style={[styles.copyButton, { backgroundColor: isDark ? theme.primary : theme.primaryStrong }]} onPress={handleCopy}>
+                  <Text style={[styles.detailsCode, { color: detailTextColor }]}>{details}</Text>
+                  <TouchableOpacity style={[styles.copyButton, { backgroundColor: accentColor }]} onPress={handleCopy}>
                     <Text style={styles.copyButtonText}>{copied ? t('sheet.copied') : t('sheet.copy')}</Text>
                   </TouchableOpacity>
                 </View>
               ) : (
-                <Text style={[styles.detailsText, { color: isDark ? theme.text : '#0E6B52' }]}>{details}</Text>
+                <Text style={[styles.detailsText, { color: detailTextColor }]}>{details}</Text>
               )}
             </View>
           ) : null}
 
           <Text style={[styles.dismissHint, { color: theme.textSoft }]}>{t('sheet.successAutoClose', { seconds: remainingSeconds })}</Text>
 
-          <TouchableOpacity style={[styles.button, { backgroundColor: isDark ? theme.primary : theme.primaryStrong }]} onPress={onClose}>
+          <TouchableOpacity style={[styles.button, { backgroundColor: accentColor }]} onPress={onClose}>
             <Text style={styles.buttonText}>{buttonLabel === 'Perfect' ? t('sheet.successButton') : buttonLabel}</Text>
           </TouchableOpacity>
         </View>

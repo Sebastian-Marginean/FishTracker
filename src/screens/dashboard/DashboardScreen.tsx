@@ -11,6 +11,7 @@ import {
 import { useIsFocused } from '@react-navigation/native';
 import * as Location from 'expo-location';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import ConfirmActionSheet from '../../components/ConfirmActionSheet';
 import SuccessSheet from '../../components/SuccessSheet';
 import { formatDate, formatDateTime, getWeatherApiLanguage, useI18n } from '../../i18n';
 import { supabase } from '../../lib/supabase';
@@ -89,8 +90,34 @@ interface SessionHistoryItem {
   setupHistory: HistorySetupRow[];
 }
 
+interface SessionLocationChoice {
+  id: string;
+  name: string;
+  lat: number;
+  lng: number;
+  water_type?: FishLocation['water_type'] | null;
+}
+
+interface ResolvedSessionLocation {
+  id: string | null;
+  name: string;
+  waterType?: FishLocation['water_type'] | null;
+  distanceMeters?: number | null;
+}
+
 // Timestamp-uri ținute în memorie (nu MMKV — compatibil Expo Go)
-const castTimestamps: Record<number, number | null> = { 1: null, 2: null, 3: null, 4: null };
+const castTimestamps: Record<number, number | null> = {
+  1: null,
+  2: null,
+  3: null,
+  4: null,
+  5: null,
+  6: null,
+  7: null,
+  8: null,
+  9: null,
+  10: null,
+};
 const LOCATION_MATCH_RADIUS_METERS = 750;
 const HISTORY_SESSION_LIMIT = 20;
 
@@ -143,7 +170,7 @@ export default function DashboardScreen() {
   const isFocused = useIsFocused();
   const { user, profile } = useAuthStore();
   const { language, t } = useI18n();
-  const { activeSession, startSession, endSession, updateSessionLocation, castRod, saveRodSetup, addCatch, syncToSupabase } = useSessionStore();
+  const { activeSession, startSession, endSession, updateSessionLocation, addRod, removeRod, castRod, saveRodSetup, addCatch, syncToSupabase } = useSessionStore();
   const mode = useThemeStore((state) => state.mode);
   const theme = getAppTheme(mode);
   const isDark = mode === 'dark';
@@ -164,6 +191,15 @@ export default function DashboardScreen() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [sessionHistory, setSessionHistory] = useState<SessionHistoryItem[]>([]);
   const [selectedHistorySession, setSelectedHistorySession] = useState<SessionHistoryItem | null>(null);
+  const [pendingRodDelete, setPendingRodDelete] = useState<number | null>(null);
+  const [sessionLocationOptions, setSessionLocationOptions] = useState<SessionLocationChoice[]>([]);
+  const [sessionLocationModalVisible, setSessionLocationModalVisible] = useState(false);
+  const [sessionLocationMode, setSessionLocationMode] = useState<'start' | 'update'>('start');
+  const [sessionLocationQuery, setSessionLocationQuery] = useState('');
+  const [resolvingSessionLocation, setResolvingSessionLocation] = useState(false);
+  const [suggestedSessionLocation, setSuggestedSessionLocation] = useState<ResolvedSessionLocation | null>(null);
+  const [selectedSessionLocationId, setSelectedSessionLocationId] = useState<string | null>(null);
+  const [selectedSessionLocationName, setSelectedSessionLocationName] = useState('');
 
   // Timer global — tick la fiecare secundă
   useEffect(() => {
@@ -174,6 +210,19 @@ export default function DashboardScreen() {
   useEffect(() => {
     fetchWeather();
   }, []);
+
+  const getWaterTypeLabel = (value?: FishLocation['water_type'] | null) => t(`locations.waterType.${value ?? 'other'}`);
+
+  const fetchSessionLocations = async (): Promise<SessionLocationChoice[]> => {
+    const { data } = await supabase
+      .from('locations')
+      .select('id, name, lat, lng, water_type')
+      .order('name');
+
+    const mapped = (data ?? []) as SessionLocationChoice[];
+    setSessionLocationOptions(mapped);
+    return mapped;
+  };
 
   const fetchUserGroups = async (userId?: string) => {
     if (!userId) {
@@ -296,6 +345,11 @@ export default function DashboardScreen() {
   }, [user?.id, isFocused]);
 
   useEffect(() => {
+    if (!isFocused) return;
+    void fetchSessionLocations();
+  }, [isFocused]);
+
+  useEffect(() => {
     if (!user?.id) return;
 
     const channel = supabase
@@ -314,7 +368,7 @@ export default function DashboardScreen() {
     };
   }, [user?.id]);
 
-  const resolveSessionLocation = async (): Promise<{ id: string | null; name: string }> => {
+  const resolveSessionLocation = async (availableLocations: SessionLocationChoice[]): Promise<ResolvedSessionLocation> => {
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') {
@@ -324,19 +378,15 @@ export default function DashboardScreen() {
       const currentLocation =
         await Location.getLastKnownPositionAsync()
         ?? await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-      const { data } = await supabase
-        .from('locations')
-        .select('id, name, lat, lng')
-        .limit(200);
 
-      if (!data?.length) {
+      if (!availableLocations.length) {
         return { id: null, name: t('dashboard.currentLocation') };
       }
 
-      let nearestLocation: Pick<FishLocation, 'id' | 'name' | 'lat' | 'lng'> | null = null;
+      let nearestLocation: SessionLocationChoice | null = null;
       let nearestDistance = Number.POSITIVE_INFINITY;
 
-      for (const item of data as Pick<FishLocation, 'id' | 'name' | 'lat' | 'lng'>[]) {
+      for (const item of availableLocations) {
         const distance = getDistanceMeters(
           currentLocation.coords.latitude,
           currentLocation.coords.longitude,
@@ -351,13 +401,88 @@ export default function DashboardScreen() {
       }
 
       if (nearestLocation && nearestDistance <= LOCATION_MATCH_RADIUS_METERS) {
-        return { id: nearestLocation.id, name: nearestLocation.name };
+        return {
+          id: nearestLocation.id,
+          name: nearestLocation.name,
+          waterType: nearestLocation.water_type ?? 'other',
+          distanceMeters: Math.round(nearestDistance),
+        };
       }
     } catch {
       // fallback la locație generică
     }
 
     return { id: null, name: t('dashboard.currentLocation') };
+  };
+
+  const closeSessionLocationModal = () => {
+    setSessionLocationModalVisible(false);
+    setSessionLocationQuery('');
+    setResolvingSessionLocation(false);
+    setSuggestedSessionLocation(null);
+  };
+
+  const openSessionLocationPicker = async (mode: 'start' | 'update') => {
+    if (mode === 'update' && !activeSession) return;
+
+    setSessionLocationMode(mode);
+    setSessionLocationModalVisible(true);
+    setSessionLocationQuery('');
+    setResolvingSessionLocation(true);
+
+    const fallbackName = mode === 'update'
+      ? activeSession?.locationName || t('dashboard.currentLocation')
+      : t('dashboard.currentLocation');
+
+    setSelectedSessionLocationId(mode === 'update' ? activeSession?.locationId ?? null : null);
+    setSelectedSessionLocationName(fallbackName);
+
+    const availableLocations = sessionLocationOptions.length ? sessionLocationOptions : await fetchSessionLocations();
+    const suggestion = await resolveSessionLocation(availableLocations);
+    setSuggestedSessionLocation(suggestion);
+
+    if (mode === 'start') {
+      setSelectedSessionLocationId(suggestion.id);
+      setSelectedSessionLocationName(suggestion.name);
+    }
+
+    setResolvingSessionLocation(false);
+  };
+
+  const confirmSessionLocation = async () => {
+    const finalLocationName = selectedSessionLocationName.trim() || t('dashboard.currentLocation');
+
+    if (sessionLocationMode === 'update' && activeSession) {
+      await updateSessionLocation(selectedSessionLocationId, finalLocationName);
+      if (user?.id) {
+        await syncToSupabase(user.id);
+      }
+
+      closeSessionLocationModal();
+      setSuccessState({
+        title: t('dashboard.sessionLocationUpdatedTitle'),
+        message: t('dashboard.sessionLocationUpdatedMessage', { location: finalLocationName }),
+        details: selectedSessionLocationId
+          ? t('dashboard.sessionLocationUpdatedDetails')
+          : t('dashboard.sessionLocationCurrentDetails'),
+      });
+      return;
+    }
+
+    Object.keys(castTimestamps).forEach((key) => { castTimestamps[Number(key)] = null; });
+    await startSession(selectedSessionLocationId, finalLocationName);
+    closeSessionLocationModal();
+    setSuccessState({
+      title: t('dashboard.sessionStartedTitle'),
+      message: t('dashboard.sessionStartedMessage'),
+      details: selectedSessionLocationId
+        ? t('dashboard.sessionStartedWaterDetails', { location: finalLocationName })
+        : t('dashboard.sessionStartedCurrentDetails'),
+    });
+
+    if (user?.id) {
+      void syncToSupabase(user.id);
+    }
   };
 
   const fetchWeather = async () => {
@@ -391,30 +516,11 @@ export default function DashboardScreen() {
   };
 
   const handleStartSession = async () => {
-    // Resetăm timestamp-urile la pornire
-    [1, 2, 3, 4].forEach((n) => { castTimestamps[n] = null; });
-    await startSession(null, t('dashboard.searchingLake'));
-    setSuccessState({
-      title: t('dashboard.sessionStartedTitle'),
-      message: t('dashboard.sessionStartedMessage'),
-      details: t('dashboard.sessionStartedDetails'),
-    });
-
-    if (user?.id) {
-      void syncToSupabase(user.id);
-    }
-
-    void (async () => {
-      const sessionLocation = await resolveSessionLocation();
-      await updateSessionLocation(sessionLocation.id, sessionLocation.name);
-      if (user?.id) {
-        await syncToSupabase(user.id);
-      }
-    })();
+    await openSessionLocationPicker('start');
   };
 
   const handleEndSession = async () => {
-    [1, 2, 3, 4].forEach((n) => { castTimestamps[n] = null; });
+    Object.keys(castTimestamps).forEach((key) => { castTimestamps[Number(key)] = null; });
     await endSession();
     await loadSessionHistory();
     setSuccessState({
@@ -484,8 +590,40 @@ export default function DashboardScreen() {
     return '#1D9E75';
   };
 
+  const handleAddRod = () => {
+    const nextRod = addRod();
+    if (!nextRod) return;
+
+    setBaitInput('');
+    setHookInput('');
+    setEditingRod(nextRod);
+  };
+
+  const confirmRemoveRod = async () => {
+    if (!pendingRodDelete) return;
+
+    const removed = await removeRod(pendingRodDelete);
+    if (removed) {
+      castTimestamps[pendingRodDelete] = null;
+      setSuccessState({
+        title: t('dashboard.rodRemovedTitle', { number: pendingRodDelete }),
+        message: t('dashboard.rodRemovedMessage', { number: pendingRodDelete }),
+        details: t('dashboard.rodRemovedDetails'),
+      });
+    }
+
+    setPendingRodDelete(null);
+  };
+
   const isActive = !!activeSession;
   const fishForecast = weather ? buildFishForecast(weather, language) : [];
+  const visibleRodNumbers = activeSession?.rods.map((rod) => rod.rodNumber) ?? [1];
+  const filteredSessionLocationOptions = sessionLocationOptions.filter((item) => {
+    const query = sessionLocationQuery.trim().toLowerCase();
+    if (!query) return true;
+
+    return item.name.toLowerCase().includes(query) || getWaterTypeLabel(item.water_type).toLowerCase().includes(query);
+  });
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.background }]}>
@@ -501,6 +639,11 @@ export default function DashboardScreen() {
             <Text style={[styles.sessionLabel, { color: theme.textMuted }]}>
               {isActive ? t('dashboard.activeSession', { location: activeSession.locationName }) : t('dashboard.noActiveSession')}
             </Text>
+            {isActive && (
+              <TouchableOpacity onPress={() => void openSessionLocationPicker('update')}>
+                <Text style={[styles.changeLocationLinkText, { color: theme.primary }]}>{t('dashboard.changeLocation')}</Text>
+              </TouchableOpacity>
+            )}
           </View>
           {isActive ? (
             <TouchableOpacity style={styles.endBtn} onPress={handleEndSession}>
@@ -559,7 +702,7 @@ export default function DashboardScreen() {
         {/* Lansete */}
         <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('dashboard.rods')}</Text>
 
-        {[1, 2, 3, 4].map((rodNum) => {
+        {visibleRodNumbers.map((rodNum) => {
           const rod = activeSession?.rods.find((r) => r.rodNumber === rodNum);
           const elapsed = getElapsed(rodNum);
           const hasCast = castTimestamps[rodNum] !== null;
@@ -568,23 +711,33 @@ export default function DashboardScreen() {
             <View key={rodNum} style={[styles.rodCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }, !isActive && styles.rodCardDisabled]}>
               {/* Header lansetă */}
               <View style={styles.rodHeader}>
-                <View style={[styles.rodBadge, { backgroundColor: isActive ? '#1D9E75' : '#ccc' }]}>
-                  <Text style={styles.rodBadgeText}>{rodNum}</Text>
+                <View style={styles.rodHeaderMain}>
+                  <View style={[styles.rodBadge, { backgroundColor: isActive ? '#1D9E75' : '#ccc' }]}> 
+                    <Text style={styles.rodBadgeText}>{rodNum}</Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.rodTitle, { color: theme.text }]}>{t('dashboard.rod', { number: rodNum })}</Text>
+                    {rod?.baitName ? (
+                      <Text style={[styles.rodBait, { color: theme.textMuted }]}>🪱 {rod.baitName}</Text>
+                    ) : isActive ? (
+                      <TouchableOpacity onPress={() => {
+                        setBaitInput('');
+                        setHookInput('');
+                        setEditingRod(rodNum);
+                      }}>
+                        <Text style={[styles.rodBaitEmpty, { color: theme.primary }]}>{t('dashboard.addBait')}</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
                 </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={[styles.rodTitle, { color: theme.text }]}>{t('dashboard.rod', { number: rodNum })}</Text>
-                  {rod?.baitName ? (
-                    <Text style={[styles.rodBait, { color: theme.textMuted }]}>🪱 {rod.baitName}</Text>
-                  ) : isActive ? (
-                    <TouchableOpacity onPress={() => {
-                      setBaitInput('');
-                      setHookInput('');
-                      setEditingRod(rodNum);
-                    }}>
-                      <Text style={[styles.rodBaitEmpty, { color: theme.primary }]}>{t('dashboard.addBait')}</Text>
-                    </TouchableOpacity>
-                  ) : null}
-                </View>
+                {isActive && (activeSession?.rods.length ?? 0) > 1 && (
+                  <TouchableOpacity
+                    style={[styles.rodHeaderDeleteBtn, { backgroundColor: isDark ? theme.dangerSoft : '#FFF1F1', borderColor: isDark ? theme.dangerText : '#F4CACA' }]}
+                    onPress={() => setPendingRodDelete(rodNum)}
+                  >
+                    <Text style={[styles.rodHeaderDeleteText, { color: theme.dangerText }]}>{t('common.delete')}</Text>
+                  </TouchableOpacity>
+                )}
               </View>
 
               {/* Cronometru + statistici */}
@@ -656,6 +809,15 @@ export default function DashboardScreen() {
             </View>
           );
         })}
+
+        {isActive && (activeSession?.rods.length ?? 0) < 10 && (
+          <View style={[styles.addRodCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}>
+            <Text style={[styles.addRodText, { color: theme.text }]}>{t('dashboard.addRodDetails')}</Text>
+            <TouchableOpacity style={[styles.addRodButton, { backgroundColor: theme.primary }]} onPress={handleAddRod}>
+              <Text style={styles.addRodButtonText}>{t('dashboard.addRod')}</Text>
+            </TouchableOpacity>
+          </View>
+        )}
 
         {!isActive && (
           <View style={styles.noSessionBanner}>
@@ -800,6 +962,131 @@ export default function DashboardScreen() {
               </TouchableOpacity>
               <TouchableOpacity style={[styles.modalConfirm, { backgroundColor: theme.primary }]} onPress={confirmCatch}>
                 <Text style={styles.modalConfirmText}>{t('dashboard.saveWithCheck')}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={sessionLocationModalVisible} transparent animationType="slide" onRequestClose={closeSessionLocationModal}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalCard, { backgroundColor: theme.surface }]}> 
+            <Text style={[styles.modalTitle, { color: theme.text }]}>{t('dashboard.locationPickerTitle')}</Text>
+            <Text style={[styles.modalSub, { color: theme.textMuted }]}>
+              {t(sessionLocationMode === 'start' ? 'dashboard.locationPickerSubtitleStart' : 'dashboard.locationPickerSubtitleUpdate')}
+            </Text>
+
+            {resolvingSessionLocation ? (
+              <View style={styles.sessionLocationLoadingBox}>
+                <ActivityIndicator color={theme.primary} />
+                <Text style={[styles.historyLoadingText, { color: theme.textMuted }]}>{t('dashboard.locationPickerDetecting')}</Text>
+              </View>
+            ) : (
+              <>
+                {suggestedSessionLocation?.id ? (
+                  <View style={[styles.sessionLocationSuggestionCard, { backgroundColor: theme.surfaceAlt, borderColor: theme.borderSoft }]}> 
+                    <Text style={[styles.sessionLocationSectionLabel, { color: theme.textMuted }]}>{t('dashboard.locationPickerSuggested')}</Text>
+                    <TouchableOpacity
+                      style={[
+                        styles.sessionLocationRow,
+                        { backgroundColor: theme.inputBg, borderColor: theme.border },
+                        selectedSessionLocationId === suggestedSessionLocation.id && { borderColor: theme.primary, backgroundColor: isDark ? theme.surfaceAlt : theme.primarySoft },
+                      ]}
+                      onPress={() => {
+                        setSelectedSessionLocationId(suggestedSessionLocation.id);
+                        setSelectedSessionLocationName(suggestedSessionLocation.name);
+                      }}
+                    >
+                      <View style={{ flex: 1 }}>
+                        <Text style={[styles.sessionLocationTitle, { color: theme.text }]}>{suggestedSessionLocation.name}</Text>
+                        <Text style={[styles.sessionLocationMeta, { color: theme.textMuted }]}>
+                          {getWaterTypeLabel(suggestedSessionLocation.waterType)} · {t('dashboard.locationPickerDistance', { value: suggestedSessionLocation.distanceMeters ?? 0 })}
+                        </Text>
+                      </View>
+                      <View style={[styles.sessionLocationBadge, { backgroundColor: theme.primarySoft }]}> 
+                        <Text style={[styles.sessionLocationBadgeText, { color: isDark ? theme.text : theme.primaryStrong }]}>{t('dashboard.locationPickerSuggestedBadge')}</Text>
+                      </View>
+                    </TouchableOpacity>
+                  </View>
+                ) : (
+                  <Text style={[styles.sessionLocationEmptyHint, { color: theme.textSoft }]}>{t('dashboard.locationPickerNoSuggestion')}</Text>
+                )}
+
+                <TextInput
+                  style={[styles.modalInput, { borderColor: theme.border, color: theme.text, backgroundColor: theme.inputBg }]}
+                  placeholder={t('dashboard.locationPickerSearchPlaceholder')}
+                  placeholderTextColor={theme.textSoft}
+                  value={sessionLocationQuery}
+                  onChangeText={setSessionLocationQuery}
+                />
+
+                <TouchableOpacity
+                  style={[
+                    styles.sessionLocationRow,
+                    { backgroundColor: theme.inputBg, borderColor: theme.border },
+                    selectedSessionLocationId === null && { borderColor: theme.primary, backgroundColor: isDark ? theme.surfaceAlt : theme.primarySoft },
+                  ]}
+                  onPress={() => {
+                    setSelectedSessionLocationId(null);
+                    setSelectedSessionLocationName(t('dashboard.currentLocation'));
+                  }}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.sessionLocationTitle, { color: theme.text }]}>{t('dashboard.locationPickerUseCurrent')}</Text>
+                    <Text style={[styles.sessionLocationMeta, { color: theme.textMuted }]}>{t('dashboard.locationPickerUseCurrentHint')}</Text>
+                  </View>
+                </TouchableOpacity>
+
+                <ScrollView style={styles.sessionLocationList} nestedScrollEnabled>
+                  {filteredSessionLocationOptions.map((item) => {
+                    const isSelected = selectedSessionLocationId === item.id;
+                    const isSuggested = suggestedSessionLocation?.id === item.id;
+
+                    return (
+                      <TouchableOpacity
+                        key={item.id}
+                        style={[
+                          styles.sessionLocationRow,
+                          { backgroundColor: theme.inputBg, borderColor: theme.border },
+                          isSelected && { borderColor: theme.primary, backgroundColor: isDark ? theme.surfaceAlt : theme.primarySoft },
+                        ]}
+                        onPress={() => {
+                          setSelectedSessionLocationId(item.id);
+                          setSelectedSessionLocationName(item.name);
+                        }}
+                      >
+                        <View style={{ flex: 1 }}>
+                          <Text style={[styles.sessionLocationTitle, { color: theme.text }]}>{item.name}</Text>
+                          <Text style={[styles.sessionLocationMeta, { color: theme.textMuted }]}>{getWaterTypeLabel(item.water_type)}</Text>
+                        </View>
+                        {isSuggested && (
+                          <View style={[styles.sessionLocationBadge, { backgroundColor: theme.primarySoft }]}> 
+                            <Text style={[styles.sessionLocationBadgeText, { color: isDark ? theme.text : theme.primaryStrong }]}>{t('dashboard.locationPickerSuggestedBadge')}</Text>
+                          </View>
+                        )}
+                      </TouchableOpacity>
+                    );
+                  })}
+
+                  {filteredSessionLocationOptions.length === 0 && (
+                    <Text style={[styles.sessionLocationEmptyHint, { color: theme.textSoft }]}>{t('dashboard.locationPickerEmpty')}</Text>
+                  )}
+                </ScrollView>
+              </>
+            )}
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity style={[styles.modalCancel, { borderColor: theme.border }]} onPress={closeSessionLocationModal}>
+                <Text style={[styles.modalCancelText, { color: theme.textMuted }]}>{t('common.cancel')}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalConfirm, { backgroundColor: theme.primary }, resolvingSessionLocation && { opacity: 0.7 }]}
+                onPress={confirmSessionLocation}
+                disabled={resolvingSessionLocation}
+              >
+                <Text style={styles.modalConfirmText}>
+                  {t(sessionLocationMode === 'start' ? 'dashboard.locationPickerConfirmStart' : 'dashboard.locationPickerConfirmUpdate')}
+                </Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -988,43 +1275,49 @@ export default function DashboardScreen() {
                       <Text style={[styles.historyRodMeta, { color: theme.textMuted }]}>{rod.cast_count} {t('dashboard.castCount')} · {rod.catch_count} {t('dashboard.catchCount')}</Text>
                     </View>
 
-                    <Text style={[styles.historySectionLabel, { color: theme.textMuted }]}>{t('dashboard.historyBaitTimelineTitle')}</Text>
-                    {rodSetupHistory.length > 0 ? rodSetupHistory.map((entry) => (
-                      <View key={entry.id} style={[styles.historyTimelineRow, { borderTopColor: theme.borderSoft }]}> 
-                        <Text style={[styles.historyTimelineTime, { color: theme.textSoft }]}>{formatDateTime(language, entry.created_at)}</Text>
-                        <Text style={[styles.historyTimelineTitle, { color: theme.text }]}>{entry.bait_name?.trim() || t('dashboard.historyNoBaitValue')}</Text>
-                        <Text style={[styles.historyTimelineMeta, { color: theme.textMuted }]}>{t('dashboard.historyHook', { value: entry.hook_setup?.trim() || t('dashboard.historyNoHookValue') })}</Text>
-                      </View>
-                    )) : (
-                      <View style={[styles.historyFallbackBox, { backgroundColor: theme.surfaceAlt, borderColor: theme.borderSoft }]}> 
-                        <Text style={[styles.historyFallbackText, { color: theme.textMuted }]}>
-                          {fallbackBait
-                            ? t('dashboard.historyFallbackBaitOnly', { bait: fallbackBait })
-                            : t('dashboard.historyNoBaits')}
-                        </Text>
-                      </View>
-                    )}
-
-                    <Text style={[styles.historySectionLabel, { color: theme.textMuted, marginTop: 18 }]}>{t('dashboard.historyCatchesTitle')}</Text>
-                    {rodCatches.length > 0 ? rodCatches.map((item) => {
-                      const fishName = item.fish_species?.trim() || t('dashboard.historyUnknownSpecies');
-                      const fishWeight = item.weight_kg ? ` · ${Number(item.weight_kg).toFixed(2)} kg` : '';
-                      const catchSetup = findSetupForCatch(item.caught_at, rod, rodSetupHistory);
-                      const catchSetupLabel = catchSetup.bait
-                        ? t('dashboard.historyCatchSetup', { bait: catchSetup.bait, hook: catchSetup.hook || t('dashboard.historyNoHookValue') })
-                        : t('dashboard.historyCatchNoSetup');
-
-                      return (
-                        <View key={item.id} style={[styles.historyTimelineRow, { borderTopColor: theme.borderSoft }]}> 
-                          <Text style={[styles.historyTimelineTime, { color: theme.textSoft }]}>{formatDateTime(language, item.caught_at)}</Text>
-                          <Text style={[styles.historyTimelineTitle, { color: theme.text }]}>{`${fishName}${fishWeight}`}</Text>
-                          <Text style={[styles.historyTimelineMeta, { color: theme.textMuted }]}>{t('dashboard.historyCatchMeta', { rod: rod.rod_number, time: formatDateTime(language, item.caught_at) })}</Text>
-                          <Text style={[styles.historyTimelineMeta, { color: theme.textMuted }]}>{catchSetupLabel}</Text>
+                    <View style={[styles.historyTimelineSection, { backgroundColor: isDark ? theme.surfaceAlt : theme.primarySoft, borderColor: isDark ? theme.border : theme.borderSoft }]}> 
+                      <Text style={[styles.historySectionLabel, { color: isDark ? theme.text : theme.primaryStrong }]}>{t('dashboard.historyBaitTimelineTitle')}</Text>
+                      <Text style={[styles.historySectionHint, { color: theme.textMuted }]}>{t('dashboard.historyBaitTimelineHint')}</Text>
+                      {rodSetupHistory.length > 0 ? rodSetupHistory.map((entry) => (
+                        <View key={entry.id} style={[styles.historyTimelineRow, styles.historySetupRow, { borderTopColor: theme.borderSoft, borderLeftColor: isDark ? theme.primary : 'rgba(29,158,117,0.35)' }]}> 
+                          <Text style={[styles.historyTimelineTime, { color: isDark ? theme.primary : theme.primaryStrong }]}>{formatDateTime(language, entry.created_at)}</Text>
+                          <Text style={[styles.historyTimelineTitle, { color: theme.text }]}>{entry.bait_name?.trim() || t('dashboard.historyNoBaitValue')}</Text>
+                          <Text style={[styles.historyTimelineMeta, { color: theme.textMuted }]}>{t('dashboard.historyHook', { value: entry.hook_setup?.trim() || t('dashboard.historyNoHookValue') })}</Text>
                         </View>
-                      );
-                    }) : (
-                      <Text style={[styles.historySessionMeta, { color: theme.textSoft }]}>{t('dashboard.historyNoRodCatches')}</Text>
-                    )}
+                      )) : (
+                        <View style={[styles.historyFallbackBox, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
+                          <Text style={[styles.historyFallbackText, { color: theme.textMuted }]}> 
+                            {fallbackBait
+                              ? t('dashboard.historyFallbackBaitOnly', { bait: fallbackBait })
+                              : t('dashboard.historyNoBaits')}
+                          </Text>
+                        </View>
+                      )}
+                    </View>
+
+                    <View style={[styles.historyTimelineSection, styles.historyCatchSection, { backgroundColor: theme.surfaceAlt, borderColor: theme.borderSoft }]}> 
+                      <Text style={[styles.historySectionLabel, { color: theme.text }]}>{t('dashboard.historyCatchesTitle')}</Text>
+                      <Text style={[styles.historySectionHint, { color: theme.textMuted }]}>{t('dashboard.historyCatchTimelineHint')}</Text>
+                      {rodCatches.length > 0 ? rodCatches.map((item) => {
+                        const fishName = item.fish_species?.trim() || t('dashboard.historyUnknownSpecies');
+                        const fishWeight = item.weight_kg ? ` · ${Number(item.weight_kg).toFixed(2)} kg` : '';
+                        const catchSetup = findSetupForCatch(item.caught_at, rod, rodSetupHistory);
+                        const catchSetupLabel = catchSetup.bait
+                          ? t('dashboard.historyCatchSetup', { bait: catchSetup.bait, hook: catchSetup.hook || t('dashboard.historyNoHookValue') })
+                          : t('dashboard.historyCatchNoSetup');
+
+                        return (
+                          <View key={item.id} style={[styles.historyTimelineRow, styles.historyCatchDetailRow, { borderTopColor: theme.border }]}> 
+                            <Text style={[styles.historyTimelineTime, { color: theme.textSoft }]}>{formatDateTime(language, item.caught_at)}</Text>
+                            <Text style={[styles.historyTimelineTitle, { color: theme.text }]}>{`${fishName}${fishWeight}`}</Text>
+                            <Text style={[styles.historyTimelineMeta, { color: theme.textMuted }]}>{t('dashboard.historyCatchMeta', { rod: rod.rod_number, time: formatDateTime(language, item.caught_at) })}</Text>
+                            <Text style={[styles.historyTimelineMeta, { color: theme.textMuted }]}>{catchSetupLabel}</Text>
+                          </View>
+                        );
+                      }) : (
+                        <Text style={[styles.historySessionMeta, { color: theme.textSoft }]}>{t('dashboard.historyNoRodCatches')}</Text>
+                      )}
+                    </View>
                   </View>
                 );
               })}
@@ -1039,6 +1332,15 @@ export default function DashboardScreen() {
         message={successState?.message ?? ''}
         details={successState?.details}
         onClose={() => setSuccessState(null)}
+      />
+
+      <ConfirmActionSheet
+        visible={pendingRodDelete !== null}
+        title={t('dashboard.removeRodTitle', { number: pendingRodDelete ?? '' })}
+        message={t('dashboard.removeRodMessage', { number: pendingRodDelete ?? '' })}
+        confirmLabel={t('dashboard.removeRodConfirm')}
+        onConfirm={confirmRemoveRod}
+        onClose={() => setPendingRodDelete(null)}
       />
     </SafeAreaView>
   );
@@ -1064,6 +1366,7 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', marginBottom: 14, gap: 10 },
   greeting: { fontSize: 19, fontWeight: '700', color: '#1a1a1a' },
   sessionLabel: { fontSize: 12, color: '#777', marginTop: 2 },
+  changeLocationLinkText: { fontSize: 12, fontWeight: '700', marginTop: 8 },
   startBtn: { backgroundColor: '#1D9E75', paddingHorizontal: 14, paddingVertical: 10, borderRadius: 10 },
   startBtnText: { color: '#fff', fontSize: 13, fontWeight: '700' },
   endBtn: { backgroundColor: '#E24B4A', paddingHorizontal: 14, paddingVertical: 10, borderRadius: 10 },
@@ -1107,12 +1410,22 @@ const styles = StyleSheet.create({
   },
   rodCardDisabled: { opacity: 0.5 },
 
-  rodHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, marginBottom: 12 },
+  rodHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 12 },
+  rodHeaderMain: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, flex: 1 },
   rodBadge: { width: 30, height: 30, borderRadius: 15, alignItems: 'center', justifyContent: 'center', marginTop: 1 },
   rodBadgeText: { color: '#fff', fontWeight: '800', fontSize: 14 },
   rodTitle: { fontSize: 15, fontWeight: '700', color: '#1a1a1a' },
   rodBait: { fontSize: 12, color: '#555', marginTop: 2 },
   rodBaitEmpty: { fontSize: 12, color: '#1D9E75', marginTop: 2 },
+  rodHeaderDeleteBtn: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  rodHeaderDeleteText: { fontSize: 11, fontWeight: '800' },
   hookText: { fontSize: 12, color: '#888', marginBottom: 10 },
 
   timerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
@@ -1133,6 +1446,16 @@ const styles = StyleSheet.create({
   catchBtnText: { fontSize: 13, fontWeight: '700', color: '#085041' },
   editBtn: { width: 42, backgroundColor: '#f5f5f5', paddingVertical: 11, borderRadius: 10, alignItems: 'center' },
   editBtnText: { fontSize: 16 },
+  addRodCard: {
+    borderRadius: 16,
+    borderWidth: 0.5,
+    padding: 14,
+    marginBottom: 10,
+    alignItems: 'center',
+  },
+  addRodText: { fontSize: 13, lineHeight: 19, textAlign: 'center', marginBottom: 10 },
+  addRodButton: { borderRadius: 12, paddingHorizontal: 16, paddingVertical: 12 },
+  addRodButtonText: { color: '#fff', fontSize: 13, fontWeight: '800' },
 
   noSessionBanner: { alignItems: 'center', padding: 20 },
   noSessionText: { fontSize: 14, color: '#aaa', textAlign: 'center' },
@@ -1167,6 +1490,30 @@ const styles = StyleSheet.create({
   modalCancelText: { fontSize: 15, color: '#666', fontWeight: '500' },
   modalConfirm: { flex: 1, padding: 14, borderRadius: 12, backgroundColor: '#1D9E75', alignItems: 'center' },
   modalConfirmText: { fontSize: 15, color: '#fff', fontWeight: '700' },
+  sessionLocationLoadingBox: { paddingVertical: 20, alignItems: 'center', gap: 10 },
+  sessionLocationSuggestionCard: {
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 12,
+  },
+  sessionLocationSectionLabel: { fontSize: 11, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 },
+  sessionLocationList: { maxHeight: 260, marginTop: 10 },
+  sessionLocationRow: {
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    marginBottom: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  sessionLocationTitle: { fontSize: 14, fontWeight: '800' },
+  sessionLocationMeta: { fontSize: 12, marginTop: 4 },
+  sessionLocationEmptyHint: { fontSize: 12, lineHeight: 18, marginBottom: 10 },
+  sessionLocationBadge: { borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6 },
+  sessionLocationBadgeText: { fontSize: 11, fontWeight: '800' },
 
   forecastSafe: { flex: 1, backgroundColor: '#f4f6f8' },
   forecastHeader: {
@@ -1336,10 +1683,31 @@ const styles = StyleSheet.create({
     padding: 14,
     marginBottom: 12,
   },
+  historyTimelineSection: {
+    borderRadius: 16,
+    borderWidth: 1,
+    padding: 12,
+    marginTop: 12,
+  },
+  historyCatchSection: {
+    marginTop: 16,
+  },
+  historySectionHint: { fontSize: 12, marginTop: 4 },
   historyTimelineRow: {
     borderTopWidth: 0.5,
     paddingTop: 10,
     marginTop: 10,
+  },
+  historySetupRow: {
+    paddingLeft: 10,
+    borderLeftWidth: 3,
+    borderLeftColor: 'rgba(29,158,117,0.35)',
+  },
+  historyCatchDetailRow: {
+    paddingLeft: 12,
+    backgroundColor: 'rgba(255,255,255,0.35)',
+    borderRadius: 12,
+    paddingBottom: 10,
   },
   historyTimelineTime: { fontSize: 11, marginBottom: 4 },
   historyTimelineTitle: { fontSize: 14, fontWeight: '800' },
