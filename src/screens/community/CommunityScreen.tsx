@@ -40,9 +40,18 @@ interface PublicProfileSheetState {
   avatarUrl?: string;
 }
 
+function getDisplayName(fullName?: string | null, username?: string | null, fallback?: string) {
+  const normalizedFullName = fullName?.trim();
+  if (normalizedFullName) return normalizedFullName;
+  const normalizedUsername = username?.trim();
+  if (normalizedUsername) return `@${normalizedUsername}`;
+  return fallback ?? '';
+}
+
 interface PublicProfileDetails extends SearchProfileResult {
   bio?: string | null;
   created_at: string;
+  role?: 'user' | 'admin';
   muted_until?: string | null;
   mute_permanent?: boolean;
   banned_until?: string | null;
@@ -96,6 +105,7 @@ export default function CommunityScreen() {
   const [moderationDuration, setModerationDuration] = useState<ModerationDuration>('7d');
   const [moderationTarget, setModerationTarget] = useState<PublicProfileDetails | null>(null);
   const [moderatingProfile, setModeratingProfile] = useState(false);
+  const [updatingAdminRole, setUpdatingAdminRole] = useState(false);
   const [successState, setSuccessState] = useState<SuccessState | null>(null);
   const scrollRef = useRef<ScrollView>(null);
   const privateScrollRef = useRef<ScrollView>(null);
@@ -197,7 +207,7 @@ export default function CommunityScreen() {
     setLoadingChat(true);
     const { data } = await supabase
       .from('messages')
-      .select('id, user_id, content, media_url, created_at, profiles:profiles!messages_user_id_fkey(username, avatar_url)')
+      .select('id, user_id, content, media_url, created_at, profiles:profiles!messages_user_id_fkey(username, full_name, avatar_url)')
       .order('created_at', { ascending: true })
       .limit(60);
     if (data) setMessages(data);
@@ -424,7 +434,7 @@ export default function CommunityScreen() {
     const [profileRes, catchesRes, sessionsRes, groupsRes] = await Promise.all([
       supabase
         .from('profiles')
-        .select('id, username, full_name, avatar_url, bio, created_at, muted_until, mute_permanent, banned_until, ban_permanent')
+        .select('id, username, full_name, avatar_url, bio, created_at, role, muted_until, mute_permanent, banned_until, ban_permanent')
         .eq('id', targetUser.userId)
         .single(),
       supabase
@@ -455,6 +465,33 @@ export default function CommunityScreen() {
       groupsCount: groupsRes.count ?? 0,
     });
     setLoadingPublicProfile(false);
+  };
+
+  const applyAdminRole = async (action: 'set' | 'clear', targetOverride?: PublicProfileDetails | null) => {
+    const target = targetOverride ?? publicProfileDetails;
+    if (!target) return;
+
+    const nextRole: PublicProfileDetails['role'] = action === 'set' ? 'admin' : 'user';
+    setUpdatingAdminRole(true);
+    const { error } = await supabase
+      .from('profiles')
+      .update({ role: nextRole })
+      .eq('id', target.id);
+    setUpdatingAdminRole(false);
+
+    if (error) {
+      Alert.alert(t('common.error'), error.message);
+      return;
+    }
+
+    const updatedTarget = { ...target, role: nextRole };
+    setPublicProfileDetails(updatedTarget);
+    setSuccessState({
+      title: t('profile.updatedTitle'),
+      message: nextRole === 'admin'
+        ? t('profile.userPromotedAdminMessage', { username: target.username })
+        : t('profile.userDemotedAdminMessage', { username: target.username }),
+    });
   };
 
   const handleStartConversationFromProfile = async () => {
@@ -715,7 +752,7 @@ export default function CommunityScreen() {
         if (payload.eventType === 'INSERT') {
           const { data } = await supabase
             .from('messages')
-            .select('id, user_id, content, media_url, created_at, profiles:profiles!messages_user_id_fkey(username, avatar_url)')
+            .select('id, user_id, content, media_url, created_at, profiles:profiles!messages_user_id_fkey(username, full_name, avatar_url)')
             .eq('id', payload.new.id)
             .single();
           if (data) {
@@ -807,6 +844,8 @@ export default function CommunityScreen() {
                   message={msg.content}
                   time={msg.created_at}
                   username={msg.profiles?.username}
+                  fullName={msg.profiles?.full_name}
+                  avatarUrl={msg.profiles?.avatar_url}
                   theme={theme}
                   language={language}
                   unknownUserLabel={t('community.unknownUser')}
@@ -835,9 +874,7 @@ export default function CommunityScreen() {
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.searchResultsRow}>
                 {searchResults.map((profileResult) => (
                   <TouchableOpacity key={profileResult.id} style={[styles.personCard, { backgroundColor: theme.surfaceAlt, borderColor: theme.border }]} onPress={() => openPrivateConversation(profileResult)}>
-                    <View style={[styles.personAvatar, { backgroundColor: theme.primary }]}>
-                      <Text style={styles.personAvatarText}>{profileResult.username?.[0]?.toUpperCase() ?? '?'}</Text>
-                    </View>
+                    <AvatarCircle avatarUrl={profileResult.avatar_url} fallback={profileResult.username?.[0]?.toUpperCase() ?? '?'} size={40} backgroundColor={theme.primary} textStyle={styles.personAvatarText} />
                     <Text style={[styles.personName, { color: theme.text }]} numberOfLines={1}>@{profileResult.username}</Text>
                     <Text style={[styles.personSub, { color: theme.textMuted }]} numberOfLines={1}>{profileResult.full_name || t('community.openConversation')}</Text>
                   </TouchableOpacity>
@@ -849,9 +886,7 @@ export default function CommunityScreen() {
           {selectedConversation ? (
             <>
               <View style={[styles.privateHeader, { backgroundColor: theme.surface, borderBottomColor: theme.borderSoft }]}> 
-                <View style={[styles.personAvatar, { backgroundColor: theme.primary }]}> 
-                  <Text style={styles.personAvatarText}>{selectedConversation.otherUser.username?.[0]?.toUpperCase() ?? '?'}</Text>
-                </View>
+                <AvatarCircle avatarUrl={selectedConversation.otherUser.avatar_url} fallback={selectedConversation.otherUser.username?.[0]?.toUpperCase() ?? '?'} size={40} backgroundColor={theme.primary} textStyle={styles.personAvatarText} />
                 <View style={{ flex: 1 }}>
                   <Text style={[styles.privateTitle, { color: theme.text }]}>@{selectedConversation.otherUser.username}</Text>
                   <Text style={[styles.privateSubtitle, { color: theme.textMuted }]}>{selectedConversation.otherUser.full_name || t('community.privateConversation')}</Text>
@@ -883,7 +918,7 @@ export default function CommunityScreen() {
                       <Text style={[styles.emptyText, { color: theme.textSoft }]}>{t('community.noPrivateMessages')}</Text>
                     </View>
                   ) : privateMessages.map((msg: any) => (
-                    <MessageBubble key={msg.id} isMe={msg.user_id === user?.id} message={msg.content} time={msg.created_at} username={msg.profiles?.username} theme={theme} language={language} unknownUserLabel={t('community.unknownUser')} onLongPress={() => openPrivateMessageActions(msg)} />
+                    <MessageBubble key={msg.id} isMe={msg.user_id === user?.id} message={msg.content} time={msg.created_at} username={msg.profiles?.username} fullName={msg.profiles?.full_name} avatarUrl={msg.profiles?.avatar_url} theme={theme} language={language} unknownUserLabel={t('community.unknownUser')} onLongPress={() => openPrivateMessageActions(msg)} />
                   ))}
                 </ScrollView>
               )}
@@ -910,9 +945,7 @@ export default function CommunityScreen() {
               }
               renderItem={({ item }) => (
                 <TouchableOpacity style={[styles.dmCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]} onPress={() => setSelectedConversationId(item.conversationId)}>
-                  <View style={[styles.personAvatar, { backgroundColor: theme.primary }]}> 
-                    <Text style={styles.personAvatarText}>{item.otherUser.username?.[0]?.toUpperCase() ?? '?'}</Text>
-                  </View>
+                  <AvatarCircle avatarUrl={item.otherUser.avatar_url} fallback={item.otherUser.username?.[0]?.toUpperCase() ?? '?'} size={40} backgroundColor={theme.primary} textStyle={styles.personAvatarText} />
                   <View style={{ flex: 1 }}>
                     <Text style={[styles.dmName, { color: theme.text }]}>@{item.otherUser.username}</Text>
                     <Text style={[styles.dmPreview, { color: theme.textMuted }]} numberOfLines={1}>{item.lastMessage?.content || t('community.newConversation')}</Text>
@@ -971,7 +1004,12 @@ export default function CommunityScreen() {
                 const cardBorder = isMe ? theme.primary : index < 3 ? theme.border : theme.borderSoft;
 
                 return (
-                  <View style={[styles.lbCard, isMe && styles.lbCardMe, index < 3 && styles.lbCardTop, { backgroundColor: cardBackground, borderColor: cardBorder }]}> 
+                  <TouchableOpacity
+                    activeOpacity={isMe ? 1 : 0.9}
+                    disabled={isMe}
+                    onPress={() => openPublicProfile({ userId: item.user_id, username: item.username, avatarUrl: item.avatar_url })}
+                    style={[styles.lbCard, isMe && styles.lbCardMe, index < 3 && styles.lbCardTop, { backgroundColor: cardBackground, borderColor: cardBorder }]}
+                  > 
                     <View style={[styles.lbRankRail, { backgroundColor: theme.surfaceAlt }] }>
                       <Text style={[styles.lbRank, { color: theme.text }]}>{medals[index] ?? `${index + 1}`}</Text>
                     </View>
@@ -988,7 +1026,7 @@ export default function CommunityScreen() {
                     <View style={[styles.lbMetricPill, { backgroundColor: isDark ? theme.surfaceAlt : '#eef8f4' }] }>
                       <Text style={[styles.lbMetricValue, { color: theme.primary }]}>{metricValue}</Text>
                     </View>
-                  </View>
+                  </TouchableOpacity>
                 );
               }}
             />
@@ -1036,7 +1074,14 @@ export default function CommunityScreen() {
                     </View>
                   )}
                   <View style={{ flex: 1 }}>
-                    <Text style={[styles.profileUsername, { color: theme.text }]}>@{publicProfileDetails.username}</Text>
+                    <View style={styles.profileIdentityRow}>
+                      <Text style={[styles.profileUsername, { color: theme.text }]}>@{publicProfileDetails.username}</Text>
+                      {publicProfileDetails.role === 'admin' ? (
+                        <View style={[styles.profileAdminBadge, { backgroundColor: theme.badgeBg }]}> 
+                          <Text style={[styles.profileAdminBadgeText, { color: theme.badgeText }]}>{t('profile.admin')}</Text>
+                        </View>
+                      ) : null}
+                    </View>
                     <Text style={[styles.profileFullName, { color: theme.textMuted }]}>{publicProfileDetails.full_name?.trim() || t('community.profileNoName')}</Text>
                     <Text style={[styles.profileMemberSince, { color: theme.textSoft }]}>{t('community.profileMemberSince', { date: formatDate(language, publicProfileDetails.created_at) })}</Text>
                   </View>
@@ -1070,6 +1115,23 @@ export default function CommunityScreen() {
                     <Text style={styles.profilePrimaryButtonText}>{t('community.profileSendMessage')}</Text>
                   </TouchableOpacity>
                 </View>
+                {isAdmin && (
+                  <View style={styles.profileActionsRow}>
+                    <TouchableOpacity
+                      style={[styles.profilePrimaryButton, { backgroundColor: publicProfileDetails.role === 'admin' ? theme.surfaceAlt : theme.badgeBg, borderWidth: publicProfileDetails.role === 'admin' ? 1 : 0, borderColor: theme.border }]}
+                      onPress={() => void applyAdminRole(publicProfileDetails.role === 'admin' ? 'clear' : 'set', publicProfileDetails)}
+                      disabled={updatingAdminRole}
+                    >
+                      {updatingAdminRole ? (
+                        <ActivityIndicator color={publicProfileDetails.role === 'admin' ? theme.text : theme.badgeText} />
+                      ) : (
+                        <Text style={[styles.profilePrimaryButtonText, { color: publicProfileDetails.role === 'admin' ? theme.text : theme.badgeText }]}>
+                          {publicProfileDetails.role === 'admin' ? t('profile.removeAdmin') : t('profile.makeAdmin')}
+                        </Text>
+                      )}
+                    </TouchableOpacity>
+                  </View>
+                )}
                 {isAdmin && (
                   <View style={styles.profileActionsRow}>
                     <TouchableOpacity
@@ -1156,16 +1218,27 @@ export default function CommunityScreen() {
   );
 }
 
-function MessageBubble({ isMe, message, time, username, theme, language, unknownUserLabel, onLongPress, onPress }: { isMe: boolean; message?: string; time: string; username?: string; theme: ReturnType<typeof getAppTheme>; language: 'ro' | 'en'; unknownUserLabel: string; onLongPress?: () => void; onPress?: () => void; }) {
+function AvatarCircle({ avatarUrl, fallback, size, backgroundColor, textStyle }: { avatarUrl?: string; fallback: string; size: number; backgroundColor: string; textStyle: any }) {
+  if (avatarUrl) {
+    return <Image source={{ uri: avatarUrl }} style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: '#dfe7ec' }} />;
+  }
+
+  return (
+    <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor, alignItems: 'center', justifyContent: 'center' }}>
+      <Text style={textStyle}>{fallback}</Text>
+    </View>
+  );
+}
+
+function MessageBubble({ isMe, message, time, username, fullName, avatarUrl, theme, language, unknownUserLabel, onLongPress, onPress }: { isMe: boolean; message?: string; time: string; username?: string; fullName?: string | null; avatarUrl?: string; theme: ReturnType<typeof getAppTheme>; language: 'ro' | 'en'; unknownUserLabel: string; onLongPress?: () => void; onPress?: () => void; }) {
+  const authorLabel = getDisplayName(fullName, username, unknownUserLabel);
   return (
     <TouchableOpacity activeOpacity={0.9} delayLongPress={220} onLongPress={onLongPress} onPress={!isMe ? onPress : undefined} style={[styles.msgRow, isMe && styles.msgRowMe]}>
       {!isMe && (
-        <View style={[styles.msgAvatar, { backgroundColor: theme.primary }]}> 
-          <Text style={styles.msgAvatarText}>{username?.[0]?.toUpperCase() ?? '?'}</Text>
-        </View>
+        <AvatarCircle avatarUrl={avatarUrl} fallback={username?.[0]?.toUpperCase() ?? '?'} size={32} backgroundColor={theme.primary} textStyle={styles.msgAvatarText} />
       )}
       <View style={[styles.msgBubble, { backgroundColor: theme.surface, borderColor: theme.borderSoft }, isMe && styles.msgBubbleMe, isMe && { backgroundColor: theme.primary, borderColor: theme.primary }]}> 
-        {!isMe && <Text style={[styles.msgUsername, { color: theme.primary }]}>@{username ?? unknownUserLabel}</Text>}
+        {!isMe && <Text style={[styles.msgUsername, { color: theme.primary }]}>{authorLabel}</Text>}
         <Text style={[styles.msgContent, { color: isMe ? '#fff' : theme.text }, isMe && styles.msgContentMe]}>{message}</Text>
         <Text style={[styles.msgTime, { color: isMe ? 'rgba(255,255,255,0.65)' : theme.textSoft }]}>{formatTime(language, time, { hour: '2-digit', minute: '2-digit' })}</Text>
       </View>
@@ -1272,9 +1345,12 @@ const styles = StyleSheet.create({
   profileLoadingBox: { alignItems: 'center', paddingVertical: 28, gap: 10 },
   profileLoadingText: { fontSize: 13 },
   profileHeaderRow: { flexDirection: 'row', gap: 14, alignItems: 'center' },
+  profileIdentityRow: { flexDirection: 'row', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
   profileAvatarLarge: { width: 62, height: 62, borderRadius: 31, alignItems: 'center', justifyContent: 'center' },
   profileAvatarLargeText: { color: '#fff', fontSize: 24, fontWeight: '900' },
   profileUsername: { fontSize: 20, fontWeight: '900' },
+  profileAdminBadge: { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 999 },
+  profileAdminBadgeText: { fontSize: 10, fontWeight: '900' },
   profileFullName: { fontSize: 14, marginTop: 4 },
   profileMemberSince: { fontSize: 12, marginTop: 4 },
   profileBioBox: {

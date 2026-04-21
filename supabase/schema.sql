@@ -595,22 +595,23 @@ begin
     raise exception 'Invalid other user';
   end if;
 
-  select pcm.conversation_id
-  into existing_conversation_id
-  from public.private_conversation_members pcm
-  where pcm.user_id = current_user_id
-    and exists (
-      select 1
-      from public.private_conversation_members other_member
-      where other_member.conversation_id = pcm.conversation_id
-        and other_member.user_id = other_user_id
-    )
-    and (
-      select count(*)
-      from public.private_conversation_members member_count
-      where member_count.conversation_id = pcm.conversation_id
-    ) = 2
-  limit 1;
+  existing_conversation_id := (
+    select pcm.conversation_id
+    from public.private_conversation_members pcm
+    where pcm.user_id = current_user_id
+      and exists (
+        select 1
+        from public.private_conversation_members other_member
+        where other_member.conversation_id = pcm.conversation_id
+          and other_member.user_id = other_user_id
+      )
+      and (
+        select count(*)
+        from public.private_conversation_members member_count
+        where member_count.conversation_id = pcm.conversation_id
+      ) = 2
+    limit 1
+  );
 
   if existing_conversation_id is not null then
     return existing_conversation_id;
@@ -707,6 +708,45 @@ as $$
 $$;
 
 grant execute on function public.get_leaderboard_monthly() to authenticated;
+
+create table if not exists public.app_announcements (
+  id uuid default uuid_generate_v4() primary key,
+  title_ro text,
+  title_en text,
+  message_ro text,
+  message_en text,
+  is_active boolean not null default true,
+  created_by uuid references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_app_announcements_active_updated
+  on public.app_announcements (is_active, updated_at desc);
+
+alter table public.app_announcements enable row level security;
+
+drop policy if exists "Public view active app announcements" on public.app_announcements;
+create policy "Public view active app announcements" on public.app_announcements for select using (
+  is_active = true or public.is_admin(auth.uid())
+);
+
+drop policy if exists "Admins insert app announcements" on public.app_announcements;
+create policy "Admins insert app announcements" on public.app_announcements for insert with check (
+  public.is_admin(auth.uid()) and auth.uid() = created_by
+);
+
+drop policy if exists "Admins update app announcements" on public.app_announcements;
+create policy "Admins update app announcements" on public.app_announcements for update using (
+  public.is_admin(auth.uid())
+) with check (
+  public.is_admin(auth.uid())
+);
+
+drop policy if exists "Admins delete app announcements" on public.app_announcements;
+create policy "Admins delete app announcements" on public.app_announcements for delete using (
+  public.is_admin(auth.uid())
+);
 
 -- Profiles: toată lumea vede, doar tu editezi al tău
 drop policy if exists "Public profiles viewable" on public.profiles;

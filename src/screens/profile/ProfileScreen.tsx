@@ -35,6 +35,17 @@ interface NoticeState {
   details?: string;
 }
 
+interface AdminAnnouncement {
+  id: string;
+  title_ro?: string | null;
+  title_en?: string | null;
+  message_ro?: string | null;
+  message_en?: string | null;
+  is_active: boolean;
+  updated_at: string;
+  created_at: string;
+}
+
 type AdminTab = 'locations' | 'catches' | 'groups' | 'messages' | 'users';
 type ModerationKind = 'mute' | 'ban';
 type ModerationDuration = '1h' | '24h' | '7d' | '30d' | 'permanent';
@@ -112,6 +123,13 @@ export default function ProfileScreen() {
   const [adminMessages, setAdminMessages] = useState<AdminMessage[]>([]);
   const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
   const [adminUserSearch, setAdminUserSearch] = useState('');
+  const [updatingAdminRoleId, setUpdatingAdminRoleId] = useState<string | null>(null);
+  const [adminAnnouncement, setAdminAnnouncement] = useState<AdminAnnouncement | null>(null);
+  const [announcementTitleRo, setAnnouncementTitleRo] = useState('');
+  const [announcementTitleEn, setAnnouncementTitleEn] = useState('');
+  const [announcementMessageRo, setAnnouncementMessageRo] = useState('');
+  const [announcementMessageEn, setAnnouncementMessageEn] = useState('');
+  const [savingAnnouncement, setSavingAnnouncement] = useState(false);
   const [moderationUser, setModerationUser] = useState<AdminUser | null>(null);
   const [moderationKind, setModerationKind] = useState<ModerationKind>('mute');
   const [moderationDuration, setModerationDuration] = useState<ModerationDuration>('24h');
@@ -214,6 +232,35 @@ export default function ProfileScreen() {
     setAdminLoading(false);
   }, [isAdmin, user]);
 
+  const loadAdminAnnouncement = useCallback(async () => {
+    if (!isAdmin) {
+      setAdminAnnouncement(null);
+      setAnnouncementTitleRo('');
+      setAnnouncementTitleEn('');
+      setAnnouncementMessageRo('');
+      setAnnouncementMessageEn('');
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('app_announcements')
+      .select('id, title_ro, title_en, message_ro, message_en, is_active, updated_at, created_at')
+      .order('updated_at', { ascending: false })
+      .limit(1);
+
+    if (error) {
+      setAdminAnnouncement(null);
+      return;
+    }
+
+    const latestAnnouncement = ((data ?? [])[0] as AdminAnnouncement | undefined) ?? null;
+    setAdminAnnouncement(latestAnnouncement);
+    setAnnouncementTitleRo(latestAnnouncement?.title_ro ?? '');
+    setAnnouncementTitleEn(latestAnnouncement?.title_en ?? '');
+    setAnnouncementMessageRo(latestAnnouncement?.message_ro ?? '');
+    setAnnouncementMessageEn(latestAnnouncement?.message_en ?? '');
+  }, [isAdmin]);
+
   const moderationOptions = useMemo(() => [
     { key: '1h' as const, label: t('profile.moderationDuration1h'), ms: 60 * 60 * 1000 },
     { key: '24h' as const, label: t('profile.moderationDuration24h'), ms: 24 * 60 * 60 * 1000 },
@@ -287,13 +334,104 @@ export default function ProfileScreen() {
     await loadAdminData();
   };
 
+  const toggleAdminRole = async (targetUser: AdminUser) => {
+    const nextRole = targetUser.role === 'admin' ? 'user' : 'admin';
+    setUpdatingAdminRoleId(targetUser.id);
+
+    const { error } = await supabase
+      .from('profiles')
+      .update({ role: nextRole })
+      .eq('id', targetUser.id);
+
+    setUpdatingAdminRoleId(null);
+
+    if (error) {
+      openWarningNotice(t('common.error'), error.message);
+      return;
+    }
+
+    setSuccessState({
+      title: t('profile.updatedTitle'),
+      message: nextRole === 'admin'
+        ? t('profile.userPromotedAdminMessage', { username: targetUser.username })
+        : t('profile.userDemotedAdminMessage', { username: targetUser.username }),
+    });
+
+    await loadAdminData();
+  };
+
   const refreshAll = useCallback(async () => {
     setRefreshing(true);
     await fetchProfile();
     await loadProfileData();
     await loadAdminData();
+    await loadAdminAnnouncement();
     setRefreshing(false);
-  }, [fetchProfile, loadAdminData, loadProfileData]);
+  }, [fetchProfile, loadAdminAnnouncement, loadAdminData, loadProfileData]);
+
+  const saveAnnouncement = async () => {
+    if (!user?.id) return;
+
+    const nextTitleRo = announcementTitleRo.trim();
+    const nextTitleEn = announcementTitleEn.trim();
+    const nextMessageRo = announcementMessageRo.trim();
+    const nextMessageEn = announcementMessageEn.trim();
+
+    if (!nextTitleRo && !nextTitleEn && !nextMessageRo && !nextMessageEn) {
+      openWarningNotice(t('profile.announcementValidationTitle'), t('profile.announcementValidationMessage'));
+      return;
+    }
+
+    setSavingAnnouncement(true);
+
+    const payload = {
+      title_ro: nextTitleRo || null,
+      title_en: nextTitleEn || null,
+      message_ro: nextMessageRo || null,
+      message_en: nextMessageEn || null,
+      is_active: true,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error } = adminAnnouncement?.id
+      ? await supabase.from('app_announcements').update(payload).eq('id', adminAnnouncement.id)
+      : await supabase.from('app_announcements').insert({ ...payload, created_by: user.id });
+
+    setSavingAnnouncement(false);
+
+    if (error) {
+      openWarningNotice(t('common.error'), error.message);
+      return;
+    }
+
+    setSuccessState({
+      title: t('profile.announcementSavedTitle'),
+      message: t('profile.announcementSavedMessage'),
+    });
+    await loadAdminAnnouncement();
+  };
+
+  const deactivateAnnouncement = async () => {
+    if (!adminAnnouncement?.id) return;
+
+    setSavingAnnouncement(true);
+    const { error } = await supabase
+      .from('app_announcements')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', adminAnnouncement.id);
+    setSavingAnnouncement(false);
+
+    if (error) {
+      openWarningNotice(t('common.error'), error.message);
+      return;
+    }
+
+    setSuccessState({
+      title: t('profile.announcementHiddenTitle'),
+      message: t('profile.announcementHiddenMessage'),
+    });
+    await loadAdminAnnouncement();
+  };
 
   useFocusEffect(
     useCallback(() => {
@@ -661,6 +799,63 @@ export default function ProfileScreen() {
           </TouchableOpacity>
         </View>
 
+        {isAdmin && (
+          <View style={[styles.sectionCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('profile.announcementTitle')}</Text>
+            <Text style={[styles.sectionSub, { color: theme.textMuted }]}>{t('profile.announcementSubtitle')}</Text>
+            <Text style={[styles.announcementStatus, { color: adminAnnouncement?.is_active ? theme.primary : theme.textSoft }]}>
+              {adminAnnouncement?.is_active ? t('profile.announcementStatusActive') : t('profile.announcementStatusInactive')}
+            </Text>
+
+            <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('profile.announcementTitleRo')}</Text>
+            <TextInput
+              style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+              placeholder={t('profile.announcementTitleRo')}
+              placeholderTextColor="#bbb"
+              value={announcementTitleRo}
+              onChangeText={setAnnouncementTitleRo}
+            />
+
+            <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('profile.announcementMessageRo')}</Text>
+            <TextInput
+              style={[styles.input, styles.textArea, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+              placeholder={t('profile.announcementMessageRo')}
+              placeholderTextColor="#bbb"
+              value={announcementMessageRo}
+              onChangeText={setAnnouncementMessageRo}
+              multiline
+            />
+
+            <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('profile.announcementTitleEn')}</Text>
+            <TextInput
+              style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+              placeholder={t('profile.announcementTitleEn')}
+              placeholderTextColor="#bbb"
+              value={announcementTitleEn}
+              onChangeText={setAnnouncementTitleEn}
+            />
+
+            <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('profile.announcementMessageEn')}</Text>
+            <TextInput
+              style={[styles.input, styles.textArea, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+              placeholder={t('profile.announcementMessageEn')}
+              placeholderTextColor="#bbb"
+              value={announcementMessageEn}
+              onChangeText={setAnnouncementMessageEn}
+              multiline
+            />
+
+            <View style={styles.announcementActions}>
+              <TouchableOpacity style={[styles.primaryBtn, styles.announcementButton, { backgroundColor: theme.primary }, savingAnnouncement && styles.disabledBtn]} onPress={() => void saveAnnouncement()} disabled={savingAnnouncement}>
+                {savingAnnouncement ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>{t('profile.announcementPublish')}</Text>}
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.secondaryBtn, styles.announcementButton, { backgroundColor: theme.surfaceAlt }, (!adminAnnouncement?.is_active || savingAnnouncement) && styles.disabledBtn]} onPress={() => void deactivateAnnouncement()} disabled={!adminAnnouncement?.is_active || savingAnnouncement}>
+                <Text style={[styles.secondaryBtnText, { color: theme.text }]}>{t('profile.announcementHide')}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
         {user && (
           <View style={[styles.sectionCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
             <Text style={[styles.sectionTitle, { color: theme.text }]}>{isAdmin ? t('profile.manageTitle') : t('profile.myContentTitle')}</Text>
@@ -751,12 +946,32 @@ export default function ProfileScreen() {
                 {activeAdminTab === 'users' && filteredAdminUsers.map((item) => (
                   <View key={item.id} style={[styles.adminRow, { borderTopColor: theme.borderSoft }]}> 
                     <View style={{ flex: 1 }}>
-                      <Text style={[styles.adminRowTitle, { color: theme.text }]}>@{item.username}</Text>
+                      <View style={styles.adminUserTitleRow}>
+                        <Text style={[styles.adminRowTitle, { color: theme.text }]}>@{item.username}</Text>
+                        {item.role === 'admin' ? (
+                          <View style={[styles.inlineAdminBadge, { backgroundColor: theme.badgeBg }]}> 
+                            <Text style={[styles.inlineAdminBadgeText, { color: theme.badgeText }]}>{t('profile.admin')}</Text>
+                          </View>
+                        ) : null}
+                      </View>
                       <Text style={[styles.adminRowSubtitle, { color: theme.textMuted }]}>{item.full_name?.trim() || t('profile.userFallback')}</Text>
                       {getModerationStatusLabel(item, 'mute') ? <Text style={[styles.adminRowSubtitle, { color: theme.primary }]}>{getModerationStatusLabel(item, 'mute')}</Text> : null}
                       {getModerationStatusLabel(item, 'ban') ? <Text style={[styles.adminRowSubtitle, { color: theme.dangerText }]}>{getModerationStatusLabel(item, 'ban')}</Text> : null}
                     </View>
                     <View style={styles.moderationActions}>
+                      <TouchableOpacity
+                        style={[styles.moderationBtn, { backgroundColor: item.role === 'admin' ? theme.surfaceAlt : theme.badgeBg }]}
+                        onPress={() => void toggleAdminRole(item)}
+                        disabled={updatingAdminRoleId === item.id}
+                      >
+                        {updatingAdminRoleId === item.id ? (
+                          <ActivityIndicator color={item.role === 'admin' ? theme.text : theme.badgeText} size="small" />
+                        ) : (
+                          <Text style={[styles.moderationBtnText, { color: item.role === 'admin' ? theme.text : theme.badgeText }]}>
+                            {item.role === 'admin' ? t('profile.removeAdmin') : t('profile.makeAdmin')}
+                          </Text>
+                        )}
+                      </TouchableOpacity>
                       <TouchableOpacity
                         style={[styles.moderationBtn, { backgroundColor: isModerationActive(item, 'mute') ? theme.surfaceAlt : theme.primarySoft }]}
                         onPress={() => {
@@ -1032,6 +1247,9 @@ const styles = StyleSheet.create({
   langButtonsRow: { flexDirection: 'row', gap: 8 },
   langButton: { minWidth: 54, borderRadius: 999, borderWidth: 1, paddingHorizontal: 14, paddingVertical: 11, alignItems: 'center' },
   langButtonText: { fontSize: 12, fontWeight: '800' },
+  announcementStatus: { fontSize: 12, fontWeight: '700', marginBottom: 6 },
+  announcementActions: { flexDirection: 'row', gap: 10, marginTop: 6 },
+  announcementButton: { flex: 1, marginTop: 0 },
 
   adminTabsRow: { gap: 8, paddingBottom: 12 },
   adminSearchInput: { marginBottom: 12 },
@@ -1050,6 +1268,9 @@ const styles = StyleSheet.create({
   },
   adminRowTitle: { fontSize: 14, fontWeight: '700', color: '#1a1a1a' },
   adminRowSubtitle: { fontSize: 12, color: '#888', marginTop: 4 },
+  adminUserTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+  inlineAdminBadge: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999 },
+  inlineAdminBadgeText: { fontSize: 10, fontWeight: '800' },
   moderationActions: { gap: 8 },
   moderationBtn: { borderRadius: 10, paddingHorizontal: 10, paddingVertical: 9, minWidth: 96, alignItems: 'center' },
   moderationBtnText: { fontSize: 12, fontWeight: '800' },

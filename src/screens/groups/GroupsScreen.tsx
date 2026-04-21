@@ -6,7 +6,7 @@ import { useIsFocused } from '@react-navigation/native';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
   Modal, TextInput, Alert, ActivityIndicator,
-  FlatList, Clipboard, KeyboardAvoidingView, Platform,
+  FlatList, Clipboard, KeyboardAvoidingView, Platform, Image,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import ConfirmActionSheet from '../../components/ConfirmActionSheet';
@@ -61,6 +61,33 @@ interface SuccessState {
   variant?: 'success' | 'warning';
 }
 
+interface GroupPublicProfileSheetState {
+  userId: string;
+  username?: string;
+  avatarUrl?: string;
+}
+
+interface GroupPublicProfileDetails {
+  id: string;
+  username: string;
+  full_name?: string | null;
+  avatar_url?: string | null;
+  bio?: string | null;
+  created_at: string;
+  role?: 'user' | 'admin';
+  catchesCount: number;
+  sessionsCount: number;
+  groupsCount: number;
+}
+
+function getDisplayName(fullName?: string | null, username?: string | null, fallback?: string) {
+  const normalizedFullName = fullName?.trim();
+  if (normalizedFullName) return normalizedFullName;
+  const normalizedUsername = username?.trim();
+  if (normalizedUsername) return `@${normalizedUsername}`;
+  return fallback ?? '';
+}
+
 export default function GroupsScreen() {
   const insets = useSafeAreaInsets();
   const isFocused = useIsFocused();
@@ -95,6 +122,10 @@ export default function GroupsScreen() {
   const [successState, setSuccessState] = useState<SuccessState | null>(null);
   const [messageActionState, setMessageActionState] = useState<any | null>(null);
   const [pendingDeleteMessageId, setPendingDeleteMessageId] = useState<string | null>(null);
+  const [publicProfileState, setPublicProfileState] = useState<GroupPublicProfileSheetState | null>(null);
+  const [publicProfileDetails, setPublicProfileDetails] = useState<GroupPublicProfileDetails | null>(null);
+  const [loadingPublicProfile, setLoadingPublicProfile] = useState(false);
+  const [updatingAdminRole, setUpdatingAdminRole] = useState(false);
   const keyboardBehavior = Platform.OS === 'ios' ? 'padding' : 'height';
   const canManageActiveGroup = !!activeGroup && !!user?.id && (activeGroup.owner_id === user.id || isAdmin);
   const isModerated = (
@@ -248,13 +279,13 @@ export default function GroupsScreen() {
     // Membrii
     const { data: membersData } = await supabase
       .from('group_members')
-      .select('*, profiles(username, avatar_url)')
+      .select('*, profiles(username, full_name, avatar_url)')
       .eq('group_id', groupId);
     if (membersData) setGroupMembers(membersData);
 
     const { data: catchData } = await supabase
       .from('catches')
-      .select('id, session_id, rod_id, fish_species, weight_kg, length_cm, caught_at, notes, profiles(username), rods(rod_number, bait_custom, hook_setup)')
+      .select('id, session_id, rod_id, fish_species, weight_kg, length_cm, caught_at, notes, profiles(username, full_name), rods(rod_number, bait_custom, hook_setup)')
       .eq('group_id', groupId)
       .order('caught_at', { ascending: false })
       .limit(50);
@@ -282,7 +313,7 @@ export default function GroupsScreen() {
     setLoadingGroupMessages(true);
     const { data } = await supabase
       .from('group_messages')
-      .select('id, group_id, user_id, content, media_url, created_at, profiles:profiles!group_messages_user_id_fkey(username, avatar_url)')
+      .select('id, group_id, user_id, content, media_url, created_at, profiles:profiles!group_messages_user_id_fkey(username, full_name, avatar_url)')
       .eq('group_id', groupId)
       .order('created_at', { ascending: true })
       .limit(100);
@@ -609,6 +640,66 @@ export default function GroupsScreen() {
     Alert.alert(t('groups.inviteCopiedTitle'), t('groups.inviteCopiedMessage'));
   };
 
+  const openPublicProfile = async (targetUser: GroupPublicProfileSheetState) => {
+    if (!targetUser.userId || targetUser.userId === user?.id) return;
+
+    setPublicProfileState(targetUser);
+    setPublicProfileDetails(null);
+    setLoadingPublicProfile(true);
+
+    const [profileRes, catchesRes, sessionsRes, groupsRes] = await Promise.all([
+      supabase
+        .from('profiles')
+        .select('id, username, full_name, avatar_url, bio, created_at, role')
+        .eq('id', targetUser.userId)
+        .single(),
+      supabase.from('catches').select('id', { count: 'exact', head: true }).eq('user_id', targetUser.userId),
+      supabase.from('sessions').select('id', { count: 'exact', head: true }).eq('user_id', targetUser.userId),
+      supabase.from('group_members').select('id', { count: 'exact', head: true }).eq('user_id', targetUser.userId),
+    ]);
+
+    if (profileRes.error || !profileRes.data) {
+      setLoadingPublicProfile(false);
+      Alert.alert(t('common.error'), profileRes.error?.message ?? t('common.unknown'));
+      setPublicProfileState(null);
+      return;
+    }
+
+    setPublicProfileDetails({
+      ...(profileRes.data as Omit<GroupPublicProfileDetails, 'catchesCount' | 'sessionsCount' | 'groupsCount'>),
+      catchesCount: catchesRes.count ?? 0,
+      sessionsCount: sessionsRes.count ?? 0,
+      groupsCount: groupsRes.count ?? 0,
+    });
+    setLoadingPublicProfile(false);
+  };
+
+  const applyAdminRole = async (action: 'set' | 'clear', targetOverride?: GroupPublicProfileDetails | null) => {
+    const target = targetOverride ?? publicProfileDetails;
+    if (!target) return;
+
+    const nextRole = action === 'set' ? 'admin' : 'user';
+    setUpdatingAdminRole(true);
+    const { error } = await supabase
+      .from('profiles')
+      .update({ role: nextRole })
+      .eq('id', target.id);
+    setUpdatingAdminRole(false);
+
+    if (error) {
+      Alert.alert(t('common.error'), error.message);
+      return;
+    }
+
+    setPublicProfileDetails({ ...target, role: nextRole });
+    setSuccessState({
+      title: t('profile.updatedTitle'),
+      message: nextRole === 'admin'
+        ? t('profile.userPromotedAdminMessage', { username: target.username })
+        : t('profile.userDemotedAdminMessage', { username: target.username }),
+    });
+  };
+
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.background }] }>
       <View style={[styles.header, { paddingTop: 12 + Math.max(insets.top * 0.15, 0), backgroundColor: theme.surface, borderBottomColor: theme.borderSoft }] }>
@@ -725,14 +816,19 @@ export default function GroupsScreen() {
                   ) : groupMessages.map((message: any) => {
                     const isMe = message.user_id === user?.id;
                     return (
-                      <TouchableOpacity key={message.id} activeOpacity={0.9} delayLongPress={220} onLongPress={() => openGroupMessageActions(message)} style={[styles.groupMsgRow, isMe && styles.groupMsgRowMe]}>
+                      <TouchableOpacity
+                        key={message.id}
+                        activeOpacity={0.9}
+                        delayLongPress={220}
+                        onLongPress={() => openGroupMessageActions(message)}
+                        onPress={!isMe ? () => openPublicProfile({ userId: String(message.user_id), username: message.profiles?.username, avatarUrl: message.profiles?.avatar_url }) : undefined}
+                        style={[styles.groupMsgRow, isMe && styles.groupMsgRowMe]}
+                      >
                         {!isMe && (
-                          <View style={[styles.memberAvatar, { marginBottom: 0 }]}> 
-                            <Text style={{ color: '#fff', fontWeight: '700' }}>{message.profiles?.username?.[0]?.toUpperCase() ?? '?'}</Text>
-                          </View>
+                          <AvatarCircle avatarUrl={message.profiles?.avatar_url} fallback={message.profiles?.username?.[0]?.toUpperCase() ?? '?'} size={40} backgroundColor={theme.primary} textStyle={styles.memberAvatarText} style={{ marginBottom: 0 }} />
                         )}
                         <View style={[styles.groupMsgBubble, { backgroundColor: isMe ? theme.primary : theme.surface, borderColor: isMe ? theme.primary : theme.borderSoft }]}>
-                          {!isMe && <Text style={[styles.groupMsgUser, { color: theme.primary }]}>@{message.profiles?.username ?? t('groups.unknownUser')}</Text>}
+                          {!isMe && <Text style={[styles.groupMsgUser, { color: theme.primary }]}>{getDisplayName(message.profiles?.full_name, message.profiles?.username, t('groups.unknownUser'))}</Text>}
                           <Text style={[styles.groupMsgText, { color: isMe ? '#fff' : theme.text }]}>{message.content}</Text>
                           <Text style={[styles.groupMsgTime, { color: isMe ? 'rgba(255,255,255,0.7)' : theme.textSoft }]}>
                             {formatTime(language, message.created_at, { hour: '2-digit', minute: '2-digit' })}
@@ -778,7 +874,7 @@ export default function GroupsScreen() {
                       {c.fish_species ?? t('groups.unknownFish')}{c.weight_kg ? ` · ${c.weight_kg} kg` : ''}
                     </Text>
                     <Text style={[styles.catchMeta, { color: theme.textMuted }]}>
-                      @{c.profiles?.username ?? t('groups.unknownUser')} · {formatDate(language, c.caught_at)} · {formatTime(language, c.caught_at, { hour: '2-digit', minute: '2-digit' })}
+                      {getDisplayName(c.profiles?.full_name, c.profiles?.username, t('groups.unknownUser'))} · {formatDate(language, c.caught_at)} · {formatTime(language, c.caught_at, { hour: '2-digit', minute: '2-digit' })}
                     </Text>
                     {(() => {
                       const setup = findCatchSetup(c, groupSetupHistory);
@@ -797,16 +893,14 @@ export default function GroupsScreen() {
             {activeTab === 'statistici' && groupMembers.map((m: any) => {
               const stats = getMemberStats(m.user_id);
               return (
-                <View key={m.id} style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}>
-                  <View style={styles.memberAvatar}>
-                    <Text style={{ color: '#fff', fontWeight: '700' }}>
-                      {m.profiles?.username?.[0]?.toUpperCase() ?? '?'}
-                    </Text>
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={[styles.memberName, { color: theme.text }]}>@{m.profiles?.username ?? t('groups.unknownUser')}</Text>
-                    {m.role === 'owner' && <Text style={[styles.ownerBadge, { color: theme.badgeText }]}>{t('groups.owner')}</Text>}
-                  </View>
+                <View key={m.id} style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
+                  <TouchableOpacity style={styles.memberInfoButton} activeOpacity={0.85} onPress={() => openPublicProfile({ userId: String(m.user_id), username: m.profiles?.username, avatarUrl: m.profiles?.avatar_url })}>
+                    <AvatarCircle avatarUrl={m.profiles?.avatar_url} fallback={m.profiles?.username?.[0]?.toUpperCase() ?? '?'} size={40} backgroundColor={theme.primary} textStyle={styles.memberAvatarText} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.memberName, { color: theme.text }]}>{getDisplayName(m.profiles?.full_name, m.profiles?.username, t('groups.unknownUser'))}</Text>
+                      {m.role === 'owner' && <Text style={[styles.ownerBadge, { color: theme.badgeText }]}>{t('groups.owner')}</Text>}
+                    </View>
+                  </TouchableOpacity>
                   <View style={{ alignItems: 'flex-end' }}>
                     <Text style={[styles.statNum, { color: theme.primary }]}>{t('groups.fishCount', { count: stats.total })}</Text>
                     <Text style={[styles.statSub, { color: theme.textMuted }]}>{t('groups.totalKg', { weight: stats.totalKg })}</Text>
@@ -817,16 +911,14 @@ export default function GroupsScreen() {
             })}
 
             {activeTab === 'membri' && groupMembers.map((m: any) => (
-              <View key={m.id} style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}>
-                <View style={styles.memberAvatar}>
-                  <Text style={{ color: '#fff', fontWeight: '700' }}>
-                    {m.profiles?.username?.[0]?.toUpperCase() ?? '?'}
-                  </Text>
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={[styles.memberName, { color: theme.text }]}>@{m.profiles?.username ?? t('groups.unknownUser')}</Text>
-                  <Text style={[styles.catchMeta, { color: theme.textMuted }]}>{t('groups.activeSince', { date: formatDate(language, m.joined_at) })}</Text>
-                </View>
+              <View key={m.id} style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
+                <TouchableOpacity style={styles.memberInfoButton} activeOpacity={0.85} onPress={() => openPublicProfile({ userId: String(m.user_id), username: m.profiles?.username, avatarUrl: m.profiles?.avatar_url })}>
+                  <AvatarCircle avatarUrl={m.profiles?.avatar_url} fallback={m.profiles?.username?.[0]?.toUpperCase() ?? '?'} size={40} backgroundColor={theme.primary} textStyle={styles.memberAvatarText} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.memberName, { color: theme.text }]}>{getDisplayName(m.profiles?.full_name, m.profiles?.username, t('groups.unknownUser'))}</Text>
+                    <Text style={[styles.catchMeta, { color: theme.textMuted }]}>{t('groups.activeSince', { date: formatDate(language, m.joined_at) })}</Text>
+                  </View>
+                </TouchableOpacity>
                 <View style={[styles.roleBadge, { backgroundColor: theme.surfaceAlt }, m.role === 'owner' && { backgroundColor: theme.badgeBg }] }>
                   <Text style={[styles.roleText, { color: theme.textMuted }, m.role === 'owner' && { color: theme.badgeText }] }>
                     {m.role === 'owner' ? t('groups.ownerRole') : t('groups.memberRole')}
@@ -918,7 +1010,94 @@ export default function GroupsScreen() {
         onConfirm={confirmDeleteGroupMessage}
         onClose={() => setPendingDeleteMessageId(null)}
       />
+
+      <Modal visible={!!publicProfileState} transparent animationType="fade" onRequestClose={() => setPublicProfileState(null)}>
+        <View style={styles.profileOverlay}>
+          <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={() => setPublicProfileState(null)} />
+          <View style={[styles.profileCard, { backgroundColor: theme.surface }]}> 
+            <View style={[styles.profileHandle, { backgroundColor: isDark ? theme.border : '#D6DEE3' }]} />
+
+            {loadingPublicProfile ? (
+              <View style={styles.profileLoadingBox}>
+                <ActivityIndicator color={theme.primary} />
+                <Text style={[styles.profileLoadingText, { color: theme.textMuted }]}>{t('community.profileLoading')}</Text>
+              </View>
+            ) : publicProfileDetails ? (
+              <>
+                <View style={styles.profileHeaderRow}>
+                  <AvatarCircle avatarUrl={publicProfileDetails.avatar_url ?? undefined} fallback={publicProfileDetails.username?.[0]?.toUpperCase() ?? '?'} size={62} backgroundColor={theme.primary} textStyle={styles.profileAvatarLargeText} />
+                  <View style={{ flex: 1 }}>
+                    <View style={styles.profileIdentityRow}>
+                      <Text style={[styles.profileUsername, { color: theme.text }]}>@{publicProfileDetails.username}</Text>
+                      {publicProfileDetails.role === 'admin' ? (
+                        <View style={[styles.profileAdminBadge, { backgroundColor: theme.badgeBg }]}> 
+                          <Text style={[styles.profileAdminBadgeText, { color: theme.badgeText }]}>{t('profile.admin')}</Text>
+                        </View>
+                      ) : null}
+                    </View>
+                    <Text style={[styles.profileFullName, { color: theme.textMuted }]}>{publicProfileDetails.full_name?.trim() || t('community.profileNoName')}</Text>
+                    <Text style={[styles.profileMemberSince, { color: theme.textSoft }]}>{t('community.profileMemberSince', { date: formatDate(language, publicProfileDetails.created_at) })}</Text>
+                  </View>
+                </View>
+
+                <View style={[styles.profileBioBox, { backgroundColor: theme.surfaceAlt, borderColor: theme.borderSoft }]}> 
+                  <Text style={[styles.profileSectionLabel, { color: theme.textMuted }]}>{t('community.profilePublicData')}</Text>
+                  <Text style={[styles.profileBioText, { color: theme.text }]}>{publicProfileDetails.bio?.trim() || t('community.profileNoBio')}</Text>
+                </View>
+
+                <View style={styles.profileStatsRow}>
+                  <View style={[styles.profileStatCard, { backgroundColor: theme.surfaceAlt }]}> 
+                    <Text style={[styles.profileStatValue, { color: theme.text }]}>{publicProfileDetails.catchesCount}</Text>
+                    <Text style={[styles.profileStatLabel, { color: theme.textSoft }]}>{t('community.profileCatches')}</Text>
+                  </View>
+                  <View style={[styles.profileStatCard, { backgroundColor: theme.surfaceAlt }]}> 
+                    <Text style={[styles.profileStatValue, { color: theme.text }]}>{publicProfileDetails.sessionsCount}</Text>
+                    <Text style={[styles.profileStatLabel, { color: theme.textSoft }]}>{t('community.profileSessions')}</Text>
+                  </View>
+                  <View style={[styles.profileStatCard, { backgroundColor: theme.surfaceAlt }]}> 
+                    <Text style={[styles.profileStatValue, { color: theme.text }]}>{publicProfileDetails.groupsCount}</Text>
+                    <Text style={[styles.profileStatLabel, { color: theme.textSoft }]}>{t('community.profileGroups')}</Text>
+                  </View>
+                </View>
+
+                <View style={styles.profileActionsRow}>
+                  <TouchableOpacity style={[styles.profileSecondaryButton, { backgroundColor: theme.surfaceAlt, borderColor: theme.border }]} onPress={() => setPublicProfileState(null)}>
+                    <Text style={[styles.profileSecondaryButtonText, { color: theme.text }]}>{t('community.profileClose')}</Text>
+                  </TouchableOpacity>
+                  {isAdmin ? (
+                    <TouchableOpacity
+                      style={[styles.profilePrimaryButton, { backgroundColor: publicProfileDetails.role === 'admin' ? theme.surfaceAlt : theme.badgeBg, borderWidth: publicProfileDetails.role === 'admin' ? 1 : 0, borderColor: theme.border }]}
+                      onPress={() => void applyAdminRole(publicProfileDetails.role === 'admin' ? 'clear' : 'set', publicProfileDetails)}
+                      disabled={updatingAdminRole}
+                    >
+                      {updatingAdminRole ? (
+                        <ActivityIndicator color={publicProfileDetails.role === 'admin' ? theme.text : theme.badgeText} />
+                      ) : (
+                        <Text style={[styles.profilePrimaryButtonText, { color: publicProfileDetails.role === 'admin' ? theme.text : theme.badgeText }]}>
+                          {publicProfileDetails.role === 'admin' ? t('profile.removeAdmin') : t('profile.makeAdmin')}
+                        </Text>
+                      )}
+                    </TouchableOpacity>
+                  ) : null}
+                </View>
+              </>
+            ) : null}
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
+  );
+}
+
+function AvatarCircle({ avatarUrl, fallback, size, backgroundColor, textStyle, style }: { avatarUrl?: string; fallback: string; size: number; backgroundColor: string; textStyle: any; style?: any }) {
+  if (avatarUrl) {
+    return <Image source={{ uri: avatarUrl }} style={[{ width: size, height: size, borderRadius: size / 2, backgroundColor: '#dfe7ec' }, style]} />;
+  }
+
+  return (
+    <View style={[{ width: size, height: size, borderRadius: size / 2, backgroundColor, alignItems: 'center', justifyContent: 'center' }, style]}>
+      <Text style={textStyle}>{fallback}</Text>
+    </View>
   );
 }
 
@@ -958,7 +1137,9 @@ const styles = StyleSheet.create({
   catchMeta: { fontSize: 12, color: '#888', marginTop: 2 },
   catchDetailLine: { fontSize: 12, marginTop: 5, lineHeight: 18 },
   statCard: { backgroundColor: '#fff', borderRadius: 12, padding: 12, marginBottom: 8, flexDirection: 'row', alignItems: 'center', gap: 12, borderWidth: 0.5, borderColor: '#eee' },
+  memberInfoButton: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 12 },
   memberAvatar: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#1D9E75', alignItems: 'center', justifyContent: 'center' },
+  memberAvatarText: { color: '#fff', fontWeight: '700' },
   memberName: { fontSize: 14, fontWeight: '700', color: '#1a1a1a' },
   ownerBadge: { fontSize: 11, color: '#BA7517', fontWeight: '600' },
   statNum: { fontSize: 14, fontWeight: '700', color: '#1D9E75' },
@@ -986,6 +1167,31 @@ const styles = StyleSheet.create({
   modalCard: { backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24 },
   modalTitle: { fontSize: 18, fontWeight: '800', color: '#1a1a1a', marginBottom: 4 },
   modalSub: { fontSize: 13, color: '#888', marginBottom: 14 },
+  profileOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(5, 14, 20, 0.44)' },
+  profileCard: { borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingHorizontal: 22, paddingTop: 14, paddingBottom: Platform.OS === 'ios' ? 34 : 22 },
+  profileHandle: { width: 48, height: 5, borderRadius: 999, alignSelf: 'center', marginBottom: 18 },
+  profileLoadingBox: { alignItems: 'center', paddingVertical: 28, gap: 10 },
+  profileLoadingText: { fontSize: 13 },
+  profileHeaderRow: { flexDirection: 'row', gap: 14, alignItems: 'center' },
+  profileIdentityRow: { flexDirection: 'row', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
+  profileUsername: { fontSize: 20, fontWeight: '900' },
+  profileAdminBadge: { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 999 },
+  profileAdminBadgeText: { fontSize: 10, fontWeight: '900' },
+  profileAvatarLargeText: { color: '#fff', fontSize: 24, fontWeight: '900' },
+  profileFullName: { fontSize: 14, marginTop: 4 },
+  profileMemberSince: { fontSize: 12, marginTop: 4 },
+  profileBioBox: { marginTop: 18, borderRadius: 18, borderWidth: 1, padding: 14 },
+  profileSectionLabel: { fontSize: 11, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8 },
+  profileBioText: { fontSize: 14, lineHeight: 21 },
+  profileStatsRow: { flexDirection: 'row', gap: 10, marginTop: 16 },
+  profileStatCard: { flex: 1, borderRadius: 16, paddingVertical: 14, paddingHorizontal: 8, alignItems: 'center' },
+  profileStatValue: { fontSize: 22, fontWeight: '900' },
+  profileStatLabel: { fontSize: 11, marginTop: 4, textAlign: 'center' },
+  profileActionsRow: { flexDirection: 'row', gap: 10, marginTop: 18 },
+  profileSecondaryButton: { flex: 1, borderWidth: 1, borderRadius: 16, alignItems: 'center', justifyContent: 'center', paddingVertical: 14 },
+  profileSecondaryButtonText: { fontSize: 14, fontWeight: '800' },
+  profilePrimaryButton: { flex: 1, borderRadius: 16, alignItems: 'center', justifyContent: 'center', paddingVertical: 14 },
+  profilePrimaryButtonText: { fontSize: 14, fontWeight: '800', color: '#fff' },
   input: { borderWidth: 1, borderColor: '#e0e0e0', borderRadius: 10, padding: 12, fontSize: 14, color: '#1a1a1a', marginBottom: 10, backgroundColor: '#fafafa' },
   modalActions: { flexDirection: 'row', gap: 10, marginTop: 6 },
   cancelBtn: { flex: 1, padding: 14, borderRadius: 12, borderWidth: 1, borderColor: '#ddd', alignItems: 'center' },

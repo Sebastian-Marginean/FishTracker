@@ -131,54 +131,57 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   initialize: async () => {
     set({ isLoading: true });
 
-    const handleAuthRedirect = async (url: string | null) => {
-      if (!url || !url.startsWith(AUTH_REDIRECT_URL)) return;
+    try {
+      const handleAuthRedirect = async (url: string | null) => {
+        if (!url || !url.startsWith(AUTH_REDIRECT_URL)) return;
 
-      const normalizedUrl = url.includes('#') ? `${url.slice(0, url.indexOf('#'))}?${url.slice(url.indexOf('#') + 1)}` : url;
-      const parsedUrl = new URL(normalizedUrl);
-      const code = parsedUrl.searchParams.get('code');
-      const tokenHash = parsedUrl.searchParams.get('token_hash');
-      const type = parsedUrl.searchParams.get('type');
-      const accessToken = parsedUrl.searchParams.get('access_token');
-      const refreshToken = parsedUrl.searchParams.get('refresh_token');
+        const normalizedUrl = url.includes('#') ? `${url.slice(0, url.indexOf('#'))}?${url.slice(url.indexOf('#') + 1)}` : url;
+        const parsedUrl = new URL(normalizedUrl);
+        const code = parsedUrl.searchParams.get('code');
+        const tokenHash = parsedUrl.searchParams.get('token_hash');
+        const type = parsedUrl.searchParams.get('type');
+        const accessToken = parsedUrl.searchParams.get('access_token');
+        const refreshToken = parsedUrl.searchParams.get('refresh_token');
 
-      if (code) {
-        await supabase.auth.exchangeCodeForSession(code);
-        return;
-      }
+        if (code) {
+          await supabase.auth.exchangeCodeForSession(code);
+          return;
+        }
 
-      if (accessToken && refreshToken) {
-        await supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken });
-        return;
-      }
+        if (accessToken && refreshToken) {
+          await supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken });
+          return;
+        }
 
-      if (tokenHash && type) {
-        await supabase.auth.verifyOtp({ token_hash: tokenHash, type: type as any });
-      }
-    };
+        if (tokenHash && type) {
+          await supabase.auth.verifyOtp({ token_hash: tokenHash, type: type as any });
+        }
+      };
 
-    await handleAuthRedirect(await Linking.getInitialURL());
-    const { data: { session } } = await supabase.auth.getSession();
+      await handleAuthRedirect(await Linking.getInitialURL());
+      const { data: { session } } = await supabase.auth.getSession();
 
-    if (session?.user) {
-      await get().refreshSessionAccess(session);
-    }
-
-    // Ascultă schimbările de auth în timp real
-    supabase.auth.onAuthStateChange(async (_event, session) => {
       if (session?.user) {
         await get().refreshSessionAccess(session);
-      } else {
-        await syncProfileStatusChannel(null, () => undefined);
-        set((state) => ({ user: null, profile: null, session: null, accessBlock: state.accessBlock }));
       }
-    });
 
-    Linking.addEventListener('url', ({ url }) => {
-      void handleAuthRedirect(url);
-    });
+      supabase.auth.onAuthStateChange(async (_event, session) => {
+        if (session?.user) {
+          await get().refreshSessionAccess(session);
+        } else {
+          await syncProfileStatusChannel(null, () => undefined);
+          set((state) => ({ user: null, profile: null, session: null, accessBlock: state.accessBlock }));
+        }
+      });
 
-    set({ isLoading: false, isInitialized: true });
+      Linking.addEventListener('url', ({ url }) => {
+        void handleAuthRedirect(url);
+      });
+    } catch (error) {
+      console.error('Failed to initialize auth store:', error);
+    } finally {
+      set({ isLoading: false, isInitialized: true });
+    }
   },
 
   signIn: async (email, password) => {

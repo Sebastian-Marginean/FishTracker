@@ -18,14 +18,15 @@ import { getAppTheme, getNavigationTheme } from '../theme';
 // Screens
 import LoginScreen from '../screens/auth/LoginScreen';
 import RegisterScreen from '../screens/auth/RegisterScreen';
-import DashboardScreen from '../screens/dashboard/DashboardScreen';
-import LocationsScreen from '../screens/locations/LocationsScreen';
-import GroupsScreen from '../screens/groups/GroupsScreen';
-import CommunityScreen from '../screens/community/CommunityScreen';
-import ProfileScreen from '../screens/profile/ProfileScreen';
 
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
+
+const getDashboardScreen = () => require('../screens/dashboard/DashboardScreen').default;
+const getLocationsScreen = () => require('../screens/locations/LocationsScreen').default;
+const getGroupsScreen = () => require('../screens/groups/GroupsScreen').default;
+const getCommunityScreen = () => require('../screens/community/CommunityScreen').default;
+const getProfileScreen = () => require('../screens/profile/ProfileScreen').default;
 
 // Tab Navigator (pentru utilizatorii autentificați)
 function MainTabs() {
@@ -145,17 +146,17 @@ function MainTabs() {
     >
       <Tab.Screen
         name="Dashboard"
-        component={DashboardScreen}
+        getComponent={getDashboardScreen}
         options={{ tabBarLabel: t('nav.session'), tabBarIcon: ({ color }) => <TabIcon icon="🎣" color={color} /> }}
       />
       <Tab.Screen
         name="Locations"
-        component={LocationsScreen}
+        getComponent={getLocationsScreen}
         options={{ tabBarLabel: t('nav.locations'), tabBarIcon: ({ color }) => <TabIcon icon="📍" color={color} /> }}
       />
       <Tab.Screen
         name="Groups"
-        component={GroupsScreen}
+        getComponent={getGroupsScreen}
         options={{
           tabBarLabel: t('nav.groups'),
           tabBarIcon: ({ color }) => <TabIcon icon="👥" color={color} />,
@@ -165,7 +166,7 @@ function MainTabs() {
       />
       <Tab.Screen
         name="Community"
-        component={CommunityScreen}
+        getComponent={getCommunityScreen}
         options={{
           tabBarLabel: t('nav.community'),
           tabBarIcon: ({ color }) => <TabIcon icon="🌍" color={color} />,
@@ -175,7 +176,7 @@ function MainTabs() {
       />
       <Tab.Screen
         name="Profile"
-        component={ProfileScreen}
+        getComponent={getProfileScreen}
         options={{ tabBarLabel: t('nav.profile'), tabBarIcon: ({ color }) => <TabIcon icon="👤" color={color} /> }}
       />
     </Tab.Navigator>

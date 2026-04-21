@@ -92,6 +92,13 @@ export default function RegisterScreen({ navigation }: any) {
   const [noticeState, setNoticeState] = useState<NoticeState | null>(null);
   const [successState, setSuccessState] = useState<SuccessState | null>(null);
 
+  const goToLogin = () => {
+    setAwaitingVerification(false);
+    setPendingVerificationEmail('');
+    setVerificationCode('');
+    navigation.reset({ index: 0, routes: [{ name: 'Login' }] });
+  };
+
   const openWarningNotice = (title: string, message: string, details?: string) => {
     setNoticeState({ title, message, details });
   };
@@ -221,11 +228,11 @@ export default function RegisterScreen({ navigation }: any) {
 
     const timeoutId = setTimeout(() => {
       setSuccessState(null);
-      navigation.navigate('Login');
+      goToLogin();
     }, 2200);
 
     return () => clearTimeout(timeoutId);
-  }, [navigation, successState, t]);
+  }, [successState, t]);
 
   return (
     <KeyboardAvoidingView
@@ -392,7 +399,7 @@ export default function RegisterScreen({ navigation }: any) {
 
             <TouchableOpacity
               style={styles.linkButton}
-              onPress={() => navigation.navigate('Login')}
+              onPress={goToLogin}
             >
               <Text style={styles.linkText}>{t('auth.haveAccount')} <Text style={styles.linkBold}>{t('auth.loginNow')}</Text></Text>
             </TouchableOpacity>
@@ -408,7 +415,13 @@ export default function RegisterScreen({ navigation }: any) {
         detailsLabel={t('auth.registerVerificationSentDetailsLabel')}
         buttonLabel={t('auth.ok')}
         autoCloseMs={6500}
-        onClose={() => setSuccessState(null)}
+        onClose={() => {
+          const shouldReturnToLogin = successState?.title === t('auth.registerVerifiedTitle');
+          setSuccessState(null);
+          if (shouldReturnToLogin) {
+            goToLogin();
+          }
+        }}
       />
 
       <SuccessSheet

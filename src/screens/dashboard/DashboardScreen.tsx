@@ -5,7 +5,7 @@ import React, { useEffect, useState } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity,
   StyleSheet, Modal, TextInput,
-  Platform, RefreshControl,
+  Platform, RefreshControl, KeyboardAvoidingView,
   ActivityIndicator,
 } from 'react-native';
 import { useIsFocused } from '@react-navigation/native';
@@ -34,6 +34,7 @@ interface SuccessState {
   title: string;
   message: string;
   details?: string;
+  variant?: 'success' | 'warning';
 }
 
 interface HistorySessionRow {
@@ -189,9 +190,11 @@ export default function DashboardScreen() {
   const [hookInput, setHookInput] = useState('');
   const [historyModalVisible, setHistoryModalVisible] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [totalHistorySessions, setTotalHistorySessions] = useState(0);
   const [sessionHistory, setSessionHistory] = useState<SessionHistoryItem[]>([]);
   const [selectedHistorySession, setSelectedHistorySession] = useState<SessionHistoryItem | null>(null);
   const [pendingRodDelete, setPendingRodDelete] = useState<number | null>(null);
+  const [pendingSessionDelete, setPendingSessionDelete] = useState<SessionHistoryItem | null>(null);
   const [sessionLocationOptions, setSessionLocationOptions] = useState<SessionLocationChoice[]>([]);
   const [sessionLocationModalVisible, setSessionLocationModalVisible] = useState(false);
   const [sessionLocationMode, setSessionLocationMode] = useState<'start' | 'update'>('start');
@@ -245,11 +248,20 @@ export default function DashboardScreen() {
 
   const loadSessionHistory = async () => {
     if (!user?.id) {
+      setTotalHistorySessions(0);
       setSessionHistory([]);
       return;
     }
 
     setHistoryLoading(true);
+
+    const totalSessionsRes = await supabase
+      .from('sessions')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', user.id)
+      .not('ended_at', 'is', null);
+
+    setTotalHistorySessions(totalSessionsRes.count ?? 0);
 
     const { data: sessionsData, error: sessionsError } = await supabase
       .from('sessions')
@@ -544,8 +556,18 @@ export default function DashboardScreen() {
 
   const confirmCatch = async () => {
     if (!catchModal) return;
+    const species = catchSpecies.trim();
+
+    if (!species) {
+      setSuccessState({
+        title: t('dashboard.catchSpeciesRequiredTitle'),
+        message: t('dashboard.catchSpeciesRequiredMessage'),
+        variant: 'warning',
+      });
+      return;
+    }
+
     const weight = parseFloat(catchWeight);
-    const species = catchSpecies.trim() || t('dashboard.unknownFish');
     const weightPart = !isNaN(weight) && weight > 0 ? ` · ${weight} kg` : '';
     await addCatch(catchModal, {
       groupId: selectedCatchGroupId,
@@ -613,6 +635,38 @@ export default function DashboardScreen() {
     }
 
     setPendingRodDelete(null);
+  };
+
+  const confirmDeleteSession = async () => {
+    if (!pendingSessionDelete) return;
+
+    const targetSession = pendingSessionDelete;
+    setPendingSessionDelete(null);
+
+    const { error } = await supabase
+      .from('sessions')
+      .delete()
+      .eq('id', targetSession.id);
+
+    if (error) {
+      setSuccessState({
+        title: t('dashboard.historyDeleteFailedTitle'),
+        message: t('dashboard.historyDeleteFailedMessage'),
+        details: error.message,
+        variant: 'warning',
+      });
+      return;
+    }
+
+    if (selectedHistorySession?.id === targetSession.id) {
+      setSelectedHistorySession(null);
+    }
+
+    await loadSessionHistory();
+    setSuccessState({
+      title: t('dashboard.historyDeleteSuccessTitle'),
+      message: t('dashboard.historyDeleteSuccessMessage', { location: targetSession.locationName }),
+    });
   };
 
   const isActive = !!activeSession;
@@ -841,7 +895,7 @@ export default function DashboardScreen() {
 
           <View style={styles.historyQuickStatsRow}>
             <View style={[styles.historyQuickStat, { backgroundColor: theme.surfaceAlt }]}> 
-              <Text style={[styles.historyQuickValue, { color: theme.text }]}>{sessionHistory.length}</Text>
+              <Text style={[styles.historyQuickValue, { color: theme.text }]}>{totalHistorySessions}</Text>
               <Text style={[styles.historyQuickLabel, { color: theme.textSoft }]}>{t('dashboard.historySessionsCount')}</Text>
             </View>
             <View style={[styles.historyQuickStat, { backgroundColor: theme.surfaceAlt }]}> 
@@ -908,9 +962,10 @@ export default function DashboardScreen() {
       </Modal>
 
       {/* Modal captură */}
-      <Modal visible={catchModal !== null} transparent animationType="slide">
-        <View style={styles.modalOverlay}>
+      <Modal visible={catchModal !== null} transparent animationType="slide" onRequestClose={() => setCatchModal(null)}>
+        <KeyboardAvoidingView style={styles.modalOverlay} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={Platform.OS === 'ios' ? 24 : 0}>
           <View style={[styles.modalCard, { backgroundColor: theme.surface }]}> 
+            <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} contentContainerStyle={styles.modalScrollContent}>
             <Text style={[styles.modalTitle, { color: theme.text }]}>{t('dashboard.newCatchTitle')}</Text>
             <Text style={[styles.modalSub, { color: theme.textMuted }]}>{t('dashboard.rod', { number: catchModal ?? '' })}</Text>
             <Text style={[styles.modalLabel, { color: theme.textMuted }]}>{t('dashboard.fishSpecies')}</Text>
@@ -964,8 +1019,9 @@ export default function DashboardScreen() {
                 <Text style={styles.modalConfirmText}>{t('dashboard.saveWithCheck')}</Text>
               </TouchableOpacity>
             </View>
+            </ScrollView>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       </Modal>
 
       <Modal visible={sessionLocationModalVisible} transparent animationType="slide" onRequestClose={closeSessionLocationModal}>
@@ -1187,14 +1243,22 @@ export default function DashboardScreen() {
                           {t('dashboard.historyDuration', { value: formatSessionDuration(session.startedAt, session.endedAt) })}
                         </Text>
                       </View>
-                      <TouchableOpacity
-                        style={[styles.historyDetailsToggle, { backgroundColor: theme.primary }]}
-                        onPress={() => setSelectedHistorySession(session)}
-                      >
-                        <Text style={[styles.historyDetailsToggleText, { color: '#fff' }]}>
-                          {t('dashboard.historyOpenDetails')}
-                        </Text>
-                      </TouchableOpacity>
+                      <View style={styles.historyCardActions}>
+                        <TouchableOpacity
+                          style={[styles.historyDetailsToggle, { backgroundColor: theme.primary }]}
+                          onPress={() => setSelectedHistorySession(session)}
+                        >
+                          <Text style={[styles.historyDetailsToggleText, { color: '#fff' }]}> 
+                            {t('dashboard.historyOpenDetails')}
+                          </Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={[styles.historyDeleteToggle, { backgroundColor: isDark ? theme.dangerSoft : '#FFF1F1', borderColor: isDark ? theme.dangerText : '#F4CACA' }]}
+                          onPress={() => setPendingSessionDelete(session)}
+                        >
+                          <Text style={[styles.historyDeleteToggleText, { color: theme.dangerText }]}>{t('common.delete')}</Text>
+                        </TouchableOpacity>
+                      </View>
                     </View>
 
                     <View style={styles.historyMetricsRow}>
@@ -1246,6 +1310,13 @@ export default function DashboardScreen() {
                 <Text style={[styles.historyDetailEyebrow, { color: theme.textSoft }]}>{t('dashboard.historySessionAt', { location: selectedHistorySession.locationName })}</Text>
                 <Text style={[styles.historyDetailTitle, { color: theme.text }]}>{formatDateTime(language, selectedHistorySession.startedAt)}</Text>
                 <Text style={[styles.historyDetailSub, { color: theme.textMuted }]}>{t('dashboard.historyDuration', { value: formatSessionDuration(selectedHistorySession.startedAt, selectedHistorySession.endedAt) })}</Text>
+
+                <TouchableOpacity
+                  style={[styles.historyDetailDeleteButton, { backgroundColor: isDark ? theme.dangerSoft : '#FFF1F1', borderColor: isDark ? theme.dangerText : '#F4CACA' }]}
+                  onPress={() => setPendingSessionDelete(selectedHistorySession)}
+                >
+                  <Text style={[styles.historyDetailDeleteText, { color: theme.dangerText }]}>{t('dashboard.historyDeleteAction')}</Text>
+                </TouchableOpacity>
 
                 <View style={styles.historyMetricsRow}>
                   <View style={[styles.historyMetricCard, { backgroundColor: theme.surfaceAlt }]}> 
@@ -1331,6 +1402,7 @@ export default function DashboardScreen() {
         title={successState?.title ?? ''}
         message={successState?.message ?? ''}
         details={successState?.details}
+        variant={successState?.variant ?? 'success'}
         onClose={() => setSuccessState(null)}
       />
 
@@ -1341,6 +1413,15 @@ export default function DashboardScreen() {
         confirmLabel={t('dashboard.removeRodConfirm')}
         onConfirm={confirmRemoveRod}
         onClose={() => setPendingRodDelete(null)}
+      />
+
+      <ConfirmActionSheet
+        visible={pendingSessionDelete !== null}
+        title={t('dashboard.historyDeleteTitle')}
+        message={t('dashboard.historyDeletePrompt', { location: pendingSessionDelete?.locationName ?? '' })}
+        confirmLabel={t('dashboard.historyDeleteAction')}
+        onConfirm={confirmDeleteSession}
+        onClose={() => setPendingSessionDelete(null)}
       />
     </SafeAreaView>
   );
@@ -1464,7 +1545,9 @@ const styles = StyleSheet.create({
   modalCard: {
     backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24,
     padding: 24, paddingBottom: Platform.OS === 'ios' ? 36 : 24,
+    maxHeight: '82%',
   },
+  modalScrollContent: { paddingBottom: 4 },
   modalTitle: { fontSize: 18, fontWeight: '800', color: '#1a1a1a', marginBottom: 2 },
   modalSub: { fontSize: 13, color: '#888', marginBottom: 16 },
   modalLabel: { fontSize: 13, fontWeight: '600', color: '#444', marginBottom: 6 },
@@ -1622,6 +1705,7 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   historySessionTopRow: { flexDirection: 'row', gap: 10, alignItems: 'flex-start' },
+  historyCardActions: { alignItems: 'flex-end', gap: 8 },
   historySessionTitle: { fontSize: 16, fontWeight: '800' },
   historySessionMeta: { fontSize: 12, marginTop: 4, lineHeight: 18 },
   historyDetailsToggle: {
@@ -1630,6 +1714,13 @@ const styles = StyleSheet.create({
     borderRadius: 999,
   },
   historyDetailsToggleText: { fontSize: 12, fontWeight: '800' },
+  historyDeleteToggle: {
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  historyDeleteToggleText: { fontSize: 12, fontWeight: '800' },
   historyMetricsRow: { flexDirection: 'row', gap: 8, marginTop: 14 },
   historyMetricCard: {
     flex: 1,
@@ -1677,6 +1768,15 @@ const styles = StyleSheet.create({
   historyDetailEyebrow: { fontSize: 11, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 0.8 },
   historyDetailTitle: { fontSize: 22, fontWeight: '900', marginTop: 8 },
   historyDetailSub: { fontSize: 13, marginTop: 6 },
+  historyDetailDeleteButton: {
+    marginTop: 14,
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  historyDetailDeleteText: { fontSize: 12, fontWeight: '800' },
   historyRodDetailCard: {
     borderRadius: 18,
     borderWidth: 0.5,

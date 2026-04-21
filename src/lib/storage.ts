@@ -10,6 +10,7 @@ import type { LocalSessionState, LocalRodState } from '../types';
 const KEYS = {
   ACTIVE_SESSION: 'active_session',
   PENDING_CATCHES: 'pending_catches',
+  UPDATE_NOTICE_PREFIX: 'update_notice_seen_',
 };
 
 // ─── Session activă ───────────────────────────────────────────
@@ -102,4 +103,21 @@ export const removePendingCatchesForRod = async (sessionId: string | null, rodNu
 
 export const clearPendingCatches = async (): Promise<void> => {
   await AsyncStorage.removeItem(KEYS.PENDING_CATCHES);
+};
+
+export const hasSeenNotice = async (noticeId: string): Promise<boolean> => {
+  const raw = await AsyncStorage.getItem(`${KEYS.UPDATE_NOTICE_PREFIX}${noticeId}`);
+  return raw === '1';
+};
+
+export const markNoticeSeen = async (noticeId: string): Promise<void> => {
+  await AsyncStorage.setItem(`${KEYS.UPDATE_NOTICE_PREFIX}${noticeId}`, '1');
+};
+
+export const hasSeenUpdateNotice = async (version: string): Promise<boolean> => {
+  return hasSeenNotice(version);
+};
+
+export const markUpdateNoticeSeen = async (version: string): Promise<void> => {
+  await markNoticeSeen(version);
 };
