@@ -316,6 +316,7 @@ create table if not exists public.rods (
   rod_number     int not null check (rod_number between 1 and 10),
   bait_preset_id int references public.bait_presets(id) on delete set null,
   bait_custom    text,            -- dacă nu e din preseturi
+  hook_bait      text,            -- momeala de cârlig
   hook_setup     text,            -- montură / cârlig
   cast_count     int default 0,
   last_cast_at   timestamptz,
@@ -327,6 +328,9 @@ create table if not exists public.rods (
 
 alter table public.rods
   drop constraint if exists rods_rod_number_check;
+
+alter table public.rods
+  add column if not exists hook_bait text;
 
 alter table public.rods
   add constraint rods_rod_number_check check (rod_number between 1 and 10);
@@ -341,12 +345,16 @@ create table if not exists public.rod_setup_history (
   user_id     uuid references public.profiles(id) on delete cascade not null,
   rod_number  int not null check (rod_number between 1 and 10),
   bait_name   text,
+  hook_bait   text,
   hook_setup  text,
   created_at  timestamptz default now()
 );
 
 alter table public.rod_setup_history
   drop constraint if exists rod_setup_history_rod_number_check;
+
+alter table public.rod_setup_history
+  add column if not exists hook_bait text;
 
 alter table public.rod_setup_history
   add constraint rod_setup_history_rod_number_check check (rod_number between 1 and 10);
@@ -795,16 +803,23 @@ create policy "Public locations viewable" on public.locations for select using (
 );
 drop policy if exists "Authenticated users create locations" on public.locations;
 drop policy if exists "Admins create locations" on public.locations;
-create policy "Admins create locations" on public.locations for insert with check (
-  public.is_admin(auth.uid())
-  and auth.uid() = created_by
+create policy "Authenticated users create locations" on public.locations for insert with check (
+  auth.uid() = created_by
+  and auth.role() = 'authenticated'
+  and (
+    public.is_admin(auth.uid())
+    or is_public = false
+  )
   and not public.is_user_banned(auth.uid())
 );
 drop policy if exists "Owners or admins update locations" on public.locations;
 create policy "Owners or admins update locations" on public.locations for update using (
   auth.uid() = created_by or public.is_admin(auth.uid())
 ) with check (
-  (auth.uid() = created_by or public.is_admin(auth.uid()))
+  (
+    public.is_admin(auth.uid())
+    or (auth.uid() = created_by and is_public = false)
+  )
   and not public.is_user_banned(auth.uid())
 );
 drop policy if exists "Owners or admins delete locations" on public.locations;

@@ -23,6 +23,7 @@ const ALL_ROD_NUMBERS: RodNumber[] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 const buildRodState = (rodNumber: RodNumber): LocalRodState => ({
   rodNumber,
   baitName: '',
+  hookBait: '',
   hookSetup: '',
   castCount: 0,
   lastCastTimestamp: null,
@@ -70,6 +71,9 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
       // Restaurăm timestamp-urile din MMKV pentru fiecare lansetă
       const restoredRods = await Promise.all(saved.rods.map(async (rod) => ({
         ...rod,
+        baitName: rod.baitName ?? '',
+        hookBait: rod.hookBait ?? '',
+        hookSetup: rod.hookSetup ?? '',
         lastCastTimestamp: await loadRodCastTime(rod.rodNumber),
       })));
       set({ activeSession: { ...saved, rods: restoredRods } });
@@ -242,13 +246,15 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
     if (!previousRod) return;
 
     const nextBait = updates.baitName ?? previousRod.baitName;
+    const nextHookBait = updates.hookBait ?? previousRod.hookBait;
     const nextHook = updates.hookSetup ?? previousRod.hookSetup;
     const baitChanged = nextBait !== previousRod.baitName;
+    const hookBaitChanged = nextHookBait !== previousRod.hookBait;
     const hookChanged = nextHook !== previousRod.hookSetup;
 
     get().updateRod(rodNumber, updates);
 
-    if ((!baitChanged && !hookChanged) || !userId) {
+    if ((!baitChanged && !hookBaitChanged && !hookChanged) || !userId) {
       return;
     }
 
@@ -266,6 +272,7 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
       user_id: userId,
       rod_number: rodNumber,
       bait_name: syncedRod.baitName.trim() || null,
+      hook_bait: syncedRod.hookBait.trim() || null,
       hook_setup: syncedRod.hookSetup.trim() || null,
       created_at: new Date().toISOString(),
     });
@@ -347,6 +354,7 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
               session_id: sessionId,
               rod_number: rod.rodNumber,
               bait_custom: rod.baitName,
+              hook_bait: rod.hookBait,
               hook_setup: rod.hookSetup,
               cast_count: rod.castCount,
               catch_count: rod.catchCount,

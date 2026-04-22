@@ -26,12 +26,13 @@ interface GroupSetupHistoryRow {
   rod_id?: string | null;
   rod_number: number;
   bait_name?: string | null;
+  hook_bait?: string | null;
   hook_setup?: string | null;
   created_at: string;
 }
 
 function findCatchSetup(
-  catchItem: { caught_at: string; rod_id?: string | null; rod_number?: number | null; rods?: { bait_custom?: string | null; hook_setup?: string | null } | null },
+  catchItem: { caught_at: string; rod_id?: string | null; rod_number?: number | null; rods?: { bait_custom?: string | null; hook_bait?: string | null; hook_setup?: string | null } | null },
   setupHistory: GroupSetupHistoryRow[],
 ) {
   const catchTimestamp = new Date(catchItem.caught_at).getTime();
@@ -48,6 +49,7 @@ function findCatchSetup(
 
   return {
     bait: latestEntry?.bait_name?.trim() || catchItem.rods?.bait_custom?.trim() || '',
+    hookBait: latestEntry?.hook_bait?.trim() || catchItem.rods?.hook_bait?.trim() || '',
     hook: latestEntry?.hook_setup?.trim() || catchItem.rods?.hook_setup?.trim() || '',
   };
 }
@@ -61,10 +63,16 @@ interface SuccessState {
   variant?: 'success' | 'warning';
 }
 
+interface TypingUser {
+  userId: string;
+  label: string;
+  expiresAt: number;
+}
+
 interface GroupPublicProfileSheetState {
   userId: string;
   username?: string;
-  avatarUrl?: string;
+  avatarUrl?: string | null;
 }
 
 interface GroupPublicProfileDetails {
@@ -123,6 +131,9 @@ export default function GroupsScreen() {
   const [messageActionState, setMessageActionState] = useState<any | null>(null);
   const [pendingDeleteMessageId, setPendingDeleteMessageId] = useState<string | null>(null);
   const [publicProfileState, setPublicProfileState] = useState<GroupPublicProfileSheetState | null>(null);
+  const [groupTypingUsers, setGroupTypingUsers] = useState<TypingUser[]>([]);
+  const groupTypingChannelRef = React.useRef<any>(null);
+  const groupTypingTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [publicProfileDetails, setPublicProfileDetails] = useState<GroupPublicProfileDetails | null>(null);
   const [loadingPublicProfile, setLoadingPublicProfile] = useState(false);
   const [updatingAdminRole, setUpdatingAdminRole] = useState(false);
@@ -232,13 +243,22 @@ export default function GroupsScreen() {
   useEffect(() => {
     if (!activeGroup?.id) return;
 
+    if (isFocused) {
+      void fetchGroupData(activeGroup.id);
+    }
+
+  }, [activeGroup?.id, isFocused]);
+
+  useEffect(() => {
+    if (!activeGroup?.id) return;
+
     const channel = supabase
       .channel(`group-chat-${activeGroup.id}`)
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'group_messages', filter: `group_id=eq.${activeGroup.id}` },
         () => {
-          void fetchGroupMessages(activeGroup.id);
+          void fetchGroupMessages(activeGroup.id, true);
         },
       )
       .subscribe();
@@ -247,6 +267,43 @@ export default function GroupsScreen() {
       void supabase.removeChannel(channel);
     };
   }, [activeGroup?.id]);
+
+  useEffect(() => {
+    if (!activeGroup?.id) return;
+
+    const channel = supabase
+      .channel(`group-data-${activeGroup.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'group_members', filter: `group_id=eq.${activeGroup.id}` },
+        () => {
+          void fetchGroupData(activeGroup.id);
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'catches', filter: `group_id=eq.${activeGroup.id}` },
+        () => {
+          void fetchGroupData(activeGroup.id);
+        },
+      )
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, () => {
+        void fetchGroupData(activeGroup.id);
+        void fetchMyGroups(user?.id);
+      })
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'groups', filter: `id=eq.${activeGroup.id}` },
+        () => {
+          void fetchMyGroups(user?.id);
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [activeGroup?.id, user?.id]);
 
   useEffect(() => {
     if (!user?.id) return;
@@ -269,6 +326,89 @@ export default function GroupsScreen() {
     }
   }, [activeGroup?.id, activeTab]);
 
+  useEffect(() => {
+    if (activeTab !== 'chat' || !activeGroup?.id) return;
+
+    const interval = setInterval(() => {
+      void fetchGroupMessages(activeGroup.id, true);
+      void fetchGroupUnreadCounts(user?.id);
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [activeGroup?.id, activeTab, user?.id]);
+
+  useEffect(() => {
+    const cleanup = setInterval(() => {
+      setGroupTypingUsers((prev) => prev.filter((item) => item.expiresAt > Date.now()));
+    }, 1000);
+
+    return () => clearInterval(cleanup);
+  }, []);
+
+  useEffect(() => {
+    if (groupTypingChannelRef.current) {
+      void supabase.removeChannel(groupTypingChannelRef.current);
+      groupTypingChannelRef.current = null;
+    }
+    setGroupTypingUsers([]);
+
+    if (!activeGroup?.id) return;
+
+    groupTypingChannelRef.current = supabase
+      .channel(`group-typing-${activeGroup.id}`)
+      .on('broadcast', { event: 'typing' }, ({ payload }) => {
+        const nextUserId = String(payload?.userId ?? '');
+        if (!nextUserId || nextUserId === user?.id) return;
+
+        const label = getDisplayName(payload?.fullName, payload?.username, 'anonim');
+        const isTyping = !!payload?.isTyping;
+        setGroupTypingUsers((prev) => {
+          const filtered = prev.filter((item) => item.userId !== nextUserId && item.expiresAt > Date.now());
+          if (!isTyping) return filtered;
+          return [...filtered, { userId: nextUserId, label, expiresAt: Date.now() + 3500 }];
+        });
+      })
+      .subscribe();
+
+    return () => {
+      if (groupTypingTimeoutRef.current) clearTimeout(groupTypingTimeoutRef.current);
+      if (groupTypingChannelRef.current) {
+        void supabase.removeChannel(groupTypingChannelRef.current);
+        groupTypingChannelRef.current = null;
+      }
+    };
+  }, [activeGroup?.id, user?.id]);
+
+  const getTypingText = (users: TypingUser[]) => {
+    if (users.length === 0) return null;
+    if (users.length === 1) return t('groups.typingOne', { name: users[0].label });
+    if (users.length === 2) return t('groups.typingTwo', { first: users[0].label, second: users[1].label });
+    return t('groups.typingMany');
+  };
+
+  const broadcastGroupTyping = (isTyping: boolean) => {
+    if (!groupTypingChannelRef.current || !user?.id || !activeGroup?.id) return;
+    void groupTypingChannelRef.current.send({
+      type: 'broadcast',
+      event: 'typing',
+      payload: {
+        userId: user.id,
+        username: profile?.username ?? null,
+        fullName: profile?.full_name ?? null,
+        isTyping,
+      },
+    });
+  };
+
+  const handleGroupMessageChange = (value: string) => {
+    setGroupMessageText(value);
+    broadcastGroupTyping(!!value.trim());
+    if (groupTypingTimeoutRef.current) clearTimeout(groupTypingTimeoutRef.current);
+    groupTypingTimeoutRef.current = setTimeout(() => {
+      broadcastGroupTyping(false);
+    }, 1800);
+  };
+
   const openGroup = async (group: Group) => {
     setActiveGroup(group);
     setActiveTab('jurnal');
@@ -285,17 +425,22 @@ export default function GroupsScreen() {
 
     const { data: catchData } = await supabase
       .from('catches')
-      .select('id, session_id, rod_id, fish_species, weight_kg, length_cm, caught_at, notes, profiles(username, full_name), rods(rod_number, bait_custom, hook_setup)')
+      .select('id, session_id, rod_id, user_id, fish_species, weight_kg, length_cm, caught_at, notes, profiles(username, full_name), rods(rod_number, bait_custom, hook_bait, hook_setup)')
       .eq('group_id', groupId)
       .order('caught_at', { ascending: false })
       .limit(50);
     if (catchData) {
-      setGroupCatches(catchData);
+      setGroupCatches(catchData.map((item: any) => ({
+        ...item,
+        user_id: String(item.user_id),
+        weight_kg: Number(item.weight_kg ?? 0),
+        length_cm: item.length_cm == null ? null : Number(item.length_cm),
+      })));
       const sessionIds = Array.from(new Set(catchData.map((item: any) => item.session_id).filter(Boolean)));
       if (sessionIds.length > 0) {
         const { data: setupData } = await supabase
           .from('rod_setup_history')
-          .select('id, session_id, rod_id, rod_number, bait_name, hook_setup, created_at')
+          .select('id, session_id, rod_id, rod_number, bait_name, hook_bait, hook_setup, created_at')
           .in('session_id', sessionIds)
           .order('created_at', { ascending: false });
         setGroupSetupHistory((setupData ?? []) as GroupSetupHistoryRow[]);
@@ -306,11 +451,11 @@ export default function GroupsScreen() {
       setGroupSetupHistory([]);
     }
 
-    await fetchGroupMessages(groupId);
+    await fetchGroupMessages(groupId, true);
   };
 
-  const fetchGroupMessages = async (groupId: string) => {
-    setLoadingGroupMessages(true);
+  const fetchGroupMessages = async (groupId: string, silent = false) => {
+    if (!silent) setLoadingGroupMessages(true);
     const { data } = await supabase
       .from('group_messages')
       .select('id, group_id, user_id, content, media_url, created_at, profiles:profiles!group_messages_user_id_fkey(username, full_name, avatar_url)')
@@ -318,7 +463,7 @@ export default function GroupsScreen() {
       .order('created_at', { ascending: true })
       .limit(100);
     if (data) setGroupMessages(data);
-    setLoadingGroupMessages(false);
+    if (!silent) setLoadingGroupMessages(false);
   };
 
   const canManageMessage = (messageUserId?: string) => !!user?.id && (messageUserId === user.id || isAdmin);
@@ -387,6 +532,7 @@ export default function GroupsScreen() {
     const content = groupMessageText.trim();
     const editingId = editingGroupMessage?.id;
     setGroupMessageText('');
+    broadcastGroupTyping(false);
 
     if (editingId) {
       const { error } = await supabase
@@ -406,7 +552,7 @@ export default function GroupsScreen() {
       }
 
       setEditingGroupMessage(null);
-      await fetchGroupMessages(activeGroup.id);
+      await fetchGroupMessages(activeGroup.id, true);
       return;
     }
 
@@ -427,7 +573,7 @@ export default function GroupsScreen() {
       return;
     }
 
-    await fetchGroupMessages(activeGroup.id);
+    await fetchGroupMessages(activeGroup.id, true);
     await markGroupAsRead(activeGroup.id);
   };
 
@@ -443,7 +589,7 @@ export default function GroupsScreen() {
       setGroupMessageText('');
     }
     if (activeGroup?.id) {
-      await fetchGroupMessages(activeGroup.id);
+      await fetchGroupMessages(activeGroup.id, true);
       await fetchGroupUnreadCounts(user?.id);
       refreshUnread();
     }
@@ -629,8 +775,8 @@ export default function GroupsScreen() {
   const getMemberStats = (userId: string) => {
     const memberCatches = groupCatches.filter((c) => c.user_id === userId);
     const total = memberCatches.length;
-    const totalKg = memberCatches.reduce((s, c) => s + (c.weight_kg ?? 0), 0);
-    const maxKg = memberCatches.reduce((m, c) => Math.max(m, c.weight_kg ?? 0), 0);
+    const totalKg = memberCatches.reduce((sum, catchItem) => sum + Number(catchItem.weight_kg ?? 0), 0);
+    const maxKg = memberCatches.reduce((max, catchItem) => Math.max(max, Number(catchItem.weight_kg ?? 0)), 0);
     return { total, totalKg: totalKg.toFixed(2), maxKg: maxKg.toFixed(2) };
   };
 
@@ -841,19 +987,22 @@ export default function GroupsScreen() {
               )}
 
               <View style={[styles.groupChatInput, { backgroundColor: theme.surface, borderTopColor: theme.borderSoft, paddingBottom: Math.max(insets.bottom, 12) }]}> 
-                <TextInput
-                  style={[styles.groupChatTextInput, { backgroundColor: theme.inputBg, color: theme.text, borderColor: theme.border }]}
-                  placeholder={editingGroupMessage ? t('groups.chatPlaceholderEdit') : t('groups.chatPlaceholder')}
-                  placeholderTextColor={theme.textSoft}
-                  value={groupMessageText}
-                  onChangeText={setGroupMessageText}
-                  onSubmitEditing={sendGroupMessage}
-                  returnKeyType="send"
-                  multiline
-                />
-                <TouchableOpacity style={[styles.groupChatSendBtn, { backgroundColor: theme.primary }, !groupMessageText.trim() && { opacity: 0.4 }]} onPress={sendGroupMessage} disabled={!groupMessageText.trim()}>
-                  <Text style={styles.groupChatSendText}>{editingGroupMessage ? '✓' : '↑'}</Text>
-                </TouchableOpacity>
+                {!!getTypingText(groupTypingUsers) && <Text style={[styles.groupTypingBarText, { color: theme.textSoft }]}>{getTypingText(groupTypingUsers)}</Text>}
+                <View style={styles.groupChatInputRow}>
+                  <TextInput
+                    style={[styles.groupChatTextInput, { backgroundColor: theme.inputBg, color: theme.text, borderColor: theme.border }]}
+                    placeholder={editingGroupMessage ? t('groups.chatPlaceholderEdit') : t('groups.chatPlaceholder')}
+                    placeholderTextColor={theme.textSoft}
+                    value={groupMessageText}
+                    onChangeText={handleGroupMessageChange}
+                    onSubmitEditing={sendGroupMessage}
+                    returnKeyType="send"
+                    multiline
+                  />
+                  <TouchableOpacity style={[styles.groupChatSendBtn, { backgroundColor: theme.primary }, !groupMessageText.trim() && { opacity: 0.4 }]} onPress={sendGroupMessage} disabled={!groupMessageText.trim()}>
+                    <Text style={styles.groupChatSendText}>{editingGroupMessage ? '✓' : '↑'}</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
             </KeyboardAvoidingView>
           ) : (
@@ -879,8 +1028,9 @@ export default function GroupsScreen() {
                     {(() => {
                       const setup = findCatchSetup(c, groupSetupHistory);
                       const hookValue = setup.hook || t('groups.noHookValue');
+                      const hookBaitValue = setup.hookBait || t('groups.noHookBaitValue');
                       return setup.bait
-                        ? <Text style={[styles.catchDetailLine, { color: theme.text }]}>{t('groups.catchSetup', { bait: setup.bait, hook: hookValue })}</Text>
+                        ? <Text style={[styles.catchDetailLine, { color: theme.text }]}>{t('groups.catchSetup', { bait: setup.bait, hookBait: hookBaitValue, hook: hookValue })}</Text>
                         : <Text style={[styles.catchDetailLine, { color: theme.textSoft }]}>{t('groups.catchNoSetup')}</Text>;
                     })()}
                     {c.length_cm ? <Text style={[styles.catchDetailLine, { color: theme.textMuted }]}>{t('groups.catchLength', { value: c.length_cm })}</Text> : null}
@@ -1158,8 +1308,10 @@ const styles = StyleSheet.create({
   editingAccent: { width: 4, alignSelf: 'stretch', borderRadius: 999 },
   editingTitle: { fontSize: 13, fontWeight: '800' },
   editingPreview: { fontSize: 12, marginTop: 3, lineHeight: 18 },
-  groupChatInput: { flexDirection: 'row', gap: 8, padding: 12, borderTopWidth: 0.5, alignItems: 'flex-end' },
+  groupChatInput: { gap: 8, padding: 12, borderTopWidth: 0.5 },
   editingCancel: { fontSize: 12, fontWeight: '800' },
+  groupChatInputRow: { flexDirection: 'row', gap: 8, alignItems: 'flex-end' },
+  groupTypingBarText: { fontSize: 11, fontWeight: '600', paddingHorizontal: 6, minHeight: 16 },
   groupChatTextInput: { flex: 1, borderWidth: 1, borderRadius: 18, paddingHorizontal: 14, paddingVertical: 10, fontSize: 14, maxHeight: 100 },
   groupChatSendBtn: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center' },
   groupChatSendText: { color: '#fff', fontSize: 20, fontWeight: '700' },

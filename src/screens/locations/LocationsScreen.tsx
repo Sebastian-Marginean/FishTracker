@@ -2,6 +2,7 @@
 // Gestionare lacuri/bălți — selectare, creare, istoric capturi
 
 import React, { useEffect, useRef, useState } from 'react';
+import { useIsFocused } from '@react-navigation/native';
 import {
   Animated,
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
@@ -21,6 +22,7 @@ import { getAppTheme } from '../../theme';
 import type { Location as FishLocation, Catch } from '../../types';
 
 type WaterType = FishLocation['water_type'];
+type LocationScope = 'public' | 'private';
 
 interface SuccessState {
   title: string;
@@ -121,13 +123,17 @@ export default function LocationsScreen() {
   const [locations, setLocations] = useState<FishLocation[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedLocation, setSelectedLocation] = useState<FishLocation | null>(null);
+  const [descriptionModal, setDescriptionModal] = useState(false);
   const [catches, setCatches] = useState<Catch[]>([]);
   const [createModal, setCreateModal] = useState(false);
+  const [requestModal, setRequestModal] = useState(false);
   const [searchText, setSearchText] = useState('');
+  const [locationScope, setLocationScope] = useState<LocationScope>('public');
   const [editingLocation, setEditingLocation] = useState<FishLocation | null>(null);
 
   // Form creare
   const [newName, setNewName] = useState('');
+  const [newVisibility, setNewVisibility] = useState<LocationScope>('private');
   const [newWaterType, setNewWaterType] = useState<WaterType>('lake');
   const [newDesc, setNewDesc] = useState('');
   const [newLat, setNewLat] = useState('');
@@ -144,14 +150,28 @@ export default function LocationsScreen() {
   const [remoteSearchQuery, setRemoteSearchQuery] = useState('');
   const [searchingRemote, setSearchingRemote] = useState(false);
   const [photoUri, setPhotoUri] = useState<string | null>(null);
+  const [requestName, setRequestName] = useState('');
+  const [requestWaterType, setRequestWaterType] = useState<WaterType>('lake');
+  const [requestDesc, setRequestDesc] = useState('');
+  const [requesting, setRequesting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [successState, setSuccessState] = useState<SuccessState | null>(null);
   const [noticeState, setNoticeState] = useState<NoticeState | null>(null);
   const isAdmin = profile?.role === 'admin';
+  const isFocused = useIsFocused();
 
   useEffect(() => {
-    fetchLocations();
+    void fetchLocations();
   }, []);
+
+  useEffect(() => {
+    if (!isFocused) return;
+
+    void fetchLocations();
+    if (selectedLocation?.id) {
+      void fetchCatches(selectedLocation.id);
+    }
+  }, [isFocused, selectedLocation?.id]);
 
   const normalizeLocationName = (value: string) => value.trim().replace(/\s+/g, ' ').toLowerCase();
   const waterTypeOptions: WaterType[] = ['lake', 'pond', 'river', 'danube', 'canal', 'other'];
@@ -161,7 +181,8 @@ export default function LocationsScreen() {
   const waterTypeBadgeBg = isDark ? '#21443b' : theme.primarySoft;
   const waterTypeBadgeBorder = isDark ? '#3f7a6b' : theme.border;
   const waterTypeBadgeText = isDark ? '#d9fff1' : theme.primaryStrong;
-  const canCreateLocations = isAdmin;
+  const canCreateLocations = !!user;
+  const canCreateGlobalLocations = isAdmin;
   const mapTiles = committedMapCoords ? buildMapTiles(committedMapCoords.lat, committedMapCoords.lng, mapZoom, mapViewport) : [];
   const displayedMapCoords = committedMapCoords;
   const mapPickerDisplayedCoords = mapPickerLiveCoords ?? mapPickerCoords;
@@ -249,7 +270,14 @@ export default function LocationsScreen() {
       .from('locations')
       .select('*')
       .order('name');
-    if (data) setLocations(data as FishLocation[]);
+    if (data) {
+      const nextLocations = data as FishLocation[];
+      setLocations(nextLocations);
+      setSelectedLocation((current) => {
+        if (!current) return current;
+        return nextLocations.find((item) => item.id === current.id) ?? null;
+      });
+    }
     setLoading(false);
   };
 
@@ -264,13 +292,50 @@ export default function LocationsScreen() {
   };
 
   const openLocation = (loc: FishLocation) => {
+    setDescriptionModal(false);
     setSelectedLocation(loc);
-    fetchCatches(loc.id);
+    void fetchCatches(loc.id);
   };
+
+  useEffect(() => {
+    const channel = supabase
+      .channel('locations-live')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'locations' }, () => {
+        void fetchLocations();
+      })
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedLocation?.id) return;
+
+    const channel = supabase
+      .channel(`location-detail-${selectedLocation.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'catches', filter: `location_id=eq.${selectedLocation.id}` },
+        () => {
+          void fetchCatches(selectedLocation.id);
+        },
+      )
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, () => {
+        void fetchCatches(selectedLocation.id);
+      })
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [selectedLocation?.id]);
 
   const resetLocationForm = () => {
     setEditingLocation(null);
     setNewName('');
+    setNewVisibility(isAdmin ? 'public' : 'private');
     setNewWaterType('lake');
     setNewDesc('');
     setNewLat('');
@@ -286,11 +351,7 @@ export default function LocationsScreen() {
   };
 
   const openCreateLocationModal = () => {
-    if (!canCreateLocations) {
-      setNoticeState({
-        title: t('locations.adminOnlyAddTitle'),
-        message: t('locations.adminOnlyAddMessage'),
-      });
+    if (!user) {
       return;
     }
 
@@ -298,10 +359,18 @@ export default function LocationsScreen() {
     setCreateModal(true);
   };
 
+  const openRequestLocationModal = () => {
+    setRequestName(searchText.trim());
+    setRequestWaterType('lake');
+    setRequestDesc('');
+    setRequestModal(true);
+  };
+
   const openEditLocationModal = () => {
     if (!selectedLocation) return;
     setEditingLocation(selectedLocation);
     setNewName(selectedLocation.name);
+    setNewVisibility(selectedLocation.is_public ? 'public' : 'private');
     setNewWaterType(selectedLocation.water_type ?? 'lake');
     setNewDesc(selectedLocation.description ?? '');
     setNewLat(String(selectedLocation.lat));
@@ -472,10 +541,10 @@ export default function LocationsScreen() {
     if (!newName.trim()) return Alert.alert(t('common.error'), t('locations.missingName'));
     if (!newLat || !newLng) return Alert.alert(t('common.error'), t('locations.missingCoordinates'));
     if (!user) return;
-    if (!editingLocation && !canCreateLocations) {
+    if (newVisibility === 'public' && !canCreateGlobalLocations) {
       setNoticeState({
-        title: t('locations.adminOnlyAddTitle'),
-        message: t('locations.adminOnlyAddMessage'),
+        title: t('locations.adminOnlyGlobalTitle'),
+        message: t('locations.adminOnlyGlobalMessage'),
       });
       return;
     }
@@ -517,7 +586,7 @@ export default function LocationsScreen() {
       lat: parseFloat(newLat),
       lng: parseFloat(newLng),
       photo_url: photoUrl,
-      is_public: true,
+      is_public: newVisibility === 'public',
     };
 
     const { error } = editingLocation
@@ -536,7 +605,7 @@ export default function LocationsScreen() {
       setSuccessState({
         title: editingLocation ? t('locations.updatedTitle') : t('locations.addedTitle'),
         message: editingLocation ? t('locations.updatedMessage', { name: newName }) : t('locations.addedMessage', { name: newName }),
-        details: t('locations.addedDetails'),
+        details: newVisibility === 'public' ? t('locations.addedDetailsPublic') : t('locations.addedDetailsPrivate'),
       });
       setCreateModal(false);
       resetLocationForm();
@@ -549,7 +618,72 @@ export default function LocationsScreen() {
 
   const canManageSelectedLocation = !!selectedLocation && !!user?.id && (selectedLocation.created_by === user.id || isAdmin);
 
-  const filtered = locations.filter((l) =>
+  const sendLocationRequest = async () => {
+    if (!user?.id) return;
+
+    const normalizedName = requestName.trim();
+    if (!normalizedName) {
+      Alert.alert(t('common.error'), t('locations.requestMissingName'));
+      return;
+    }
+
+    setRequesting(true);
+    const { data: adminRows, error: adminError } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('role', 'admin')
+      .neq('id', user.id);
+
+    if (adminError || !adminRows?.length) {
+      setRequesting(false);
+      Alert.alert(t('common.error'), adminError?.message ?? t('locations.requestNoAdmin'));
+      return;
+    }
+
+    const message = [
+      t('locations.requestMessageName', { name: normalizedName }),
+      t('locations.requestMessageType', { type: getWaterTypeLabel(requestWaterType) }),
+      requestDesc.trim() ? t('locations.requestMessageNotes', { notes: requestDesc.trim() }) : null,
+    ].filter(Boolean).join('\n');
+
+    for (const admin of adminRows as Array<{ id: string }>) {
+      const conversationResult = await supabase.rpc('create_or_get_private_conversation', { other_user_id: admin.id });
+      if (conversationResult.error || !conversationResult.data) {
+        setRequesting(false);
+        Alert.alert(t('common.error'), conversationResult.error?.message ?? t('common.unknown'));
+        return;
+      }
+
+      const { error } = await supabase.from('private_messages').insert({
+        conversation_id: conversationResult.data,
+        user_id: user.id,
+        content: message,
+      });
+
+      if (error) {
+        setRequesting(false);
+        Alert.alert(t('common.error'), error.message);
+        return;
+      }
+    }
+
+    setRequesting(false);
+    setRequestModal(false);
+    setRequestName('');
+    setRequestDesc('');
+    setRequestWaterType('lake');
+    setSuccessState({
+      title: t('locations.requestSentTitle'),
+      message: t('locations.requestSentMessage', { name: normalizedName }),
+      details: t('locations.requestSentDetails'),
+    });
+  };
+
+  const scopedLocations = locations.filter((item) => (
+    locationScope === 'public' ? item.is_public : !item.is_public
+  ));
+
+  const filtered = scopedLocations.filter((l) =>
     l.name.toLowerCase().includes(searchText.toLowerCase())
     || l.description?.toLowerCase().includes(searchText.toLowerCase())
     || getWaterTypeLabel(l.water_type).toLowerCase().includes(searchText.toLowerCase())
@@ -560,11 +694,18 @@ export default function LocationsScreen() {
       {/* Header */}
       <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.borderSoft }]}>
         <Text style={[styles.headerTitle, { color: theme.text }]}>📍 {t('locations.title')}</Text>
-        {canCreateLocations ? (
-          <TouchableOpacity style={[styles.addBtn, { backgroundColor: theme.primary }]} onPress={openCreateLocationModal}>
-            <Text style={styles.addBtnText}>{t('locations.add')}</Text>
-          </TouchableOpacity>
-        ) : <View style={styles.headerSpacer} />}
+        <View style={styles.headerActions}>
+          {!isAdmin && (
+            <TouchableOpacity style={[styles.requestBtn, { backgroundColor: isDark ? theme.surfaceAlt : '#EEF6FF', borderColor: theme.border }]} onPress={openRequestLocationModal}>
+              <Text style={[styles.requestBtnText, { color: theme.text }]}>{t('locations.requestAction')}</Text>
+            </TouchableOpacity>
+          )}
+          {canCreateLocations ? (
+            <TouchableOpacity style={[styles.addBtn, { backgroundColor: theme.primary }]} onPress={openCreateLocationModal}>
+              <Text style={styles.addBtnText}>{t('locations.add')}</Text>
+            </TouchableOpacity>
+          ) : <View style={styles.headerSpacer} />}
+        </View>
       </View>
 
       {/* Căutare */}
@@ -576,6 +717,21 @@ export default function LocationsScreen() {
           value={searchText}
           onChangeText={setSearchText}
         />
+        <View style={styles.scopeRow}>
+          {(['public', 'private'] as const).map((scope) => (
+            <TouchableOpacity
+              key={scope}
+              style={[
+                styles.scopeChip,
+                { backgroundColor: theme.inputBg, borderColor: theme.border },
+                locationScope === scope && { backgroundColor: theme.primary, borderColor: theme.primary },
+              ]}
+              onPress={() => setLocationScope(scope)}
+            >
+              <Text style={[styles.scopeChipText, { color: locationScope === scope ? '#fff' : theme.text }]}>{t(scope === 'public' ? 'locations.scopePublic' : 'locations.scopePrivate')}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
       </View>
 
       {loading ? (
@@ -591,7 +747,7 @@ export default function LocationsScreen() {
             <View style={styles.center}>
               <Text style={{ fontSize: 40, marginBottom: 10 }}>🏞️</Text>
               <Text style={[styles.emptyText, { color: theme.textMuted }]}>{t('locations.noneFound')}</Text>
-              <Text style={[styles.emptySubText, { color: theme.textSoft }]}>{t(canCreateLocations ? 'locations.addFirst' : 'locations.adminOnlyAddEmpty')}</Text>
+              <Text style={[styles.emptySubText, { color: theme.textSoft }]}>{t(locationScope === 'public' ? 'locations.emptyPublicHint' : 'locations.emptyPrivateHint')}</Text>
             </View>
           }
           renderItem={({ item }) => (
@@ -643,6 +799,21 @@ export default function LocationsScreen() {
               <Image source={{ uri: selectedLocation.photo_url }} style={styles.detailPhoto} />
             )}
 
+            <View style={[styles.detailInfoCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
+              <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('locations.description')}</Text>
+              <Text style={[styles.detailDescriptionPreview, { color: theme.textMuted }]} numberOfLines={4}>
+                {selectedLocation?.description?.trim() || t('locations.descriptionEmpty')}
+              </Text>
+              {!!selectedLocation?.description?.trim() && (
+                <TouchableOpacity
+                  style={[styles.descriptionButton, { backgroundColor: isDark ? theme.surfaceAlt : '#EEF6FF', borderColor: theme.border }]}
+                  onPress={() => setDescriptionModal(true)}
+                >
+                  <Text style={[styles.descriptionButtonText, { color: theme.text }]}>{t('locations.viewFullDescription')}</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+
             <Text style={[styles.sectionTitle, { color: theme.text }]}>📊 {t('locations.catchHistory')}</Text>
 
             <TouchableOpacity
@@ -669,14 +840,30 @@ export default function LocationsScreen() {
                       @{c.profiles?.username ?? 'anonim'} · {formatDate(language, c.caught_at)}
                     </Text>
                   </View>
-                  {c.is_returned && (
-                    <View style={[styles.returnedBadge, { backgroundColor: isDark ? theme.primarySoft : '#E1F5EE' }]}>
-                      <Text style={[styles.returnedText, { color: theme.primaryStrong }]}>C&R</Text>
-                    </View>
-                  )}
                 </View>
               ))
             )}
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+
+      <Modal visible={descriptionModal} animationType="slide" onRequestClose={() => setDescriptionModal(false)}>
+        <SafeAreaView style={[styles.safe, { backgroundColor: theme.background }]}> 
+          <View style={[styles.detailHeader, { backgroundColor: theme.surface, borderBottomColor: theme.borderSoft }]}> 
+            <TouchableOpacity onPress={() => setDescriptionModal(false)}>
+              <Text style={[styles.backBtn, { color: theme.primary }]}>‹ {t('common.close')}</Text>
+            </TouchableOpacity>
+            <Text style={[styles.detailTitle, { color: theme.text }]} numberOfLines={1}>{selectedLocation?.name}</Text>
+            <View style={{ width: 60 }} />
+          </View>
+
+          <ScrollView contentContainerStyle={{ padding: 16 }}>
+            <View style={[styles.detailInfoCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
+              <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('locations.description')}</Text>
+              <Text style={[styles.descriptionFullText, { color: theme.text }]}>
+                {selectedLocation?.description?.trim() || t('locations.descriptionEmpty')}
+              </Text>
+            </View>
           </ScrollView>
         </SafeAreaView>
       </Modal>
@@ -698,6 +885,30 @@ export default function LocationsScreen() {
           <ScrollView contentContainerStyle={{ padding: 16 }}>
             <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('locations.locationName')}</Text>
             <TextInput style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]} placeholder={t('locations.locationNamePlaceholder')} placeholderTextColor={theme.textSoft} value={newName} onChangeText={setNewName} />
+
+            <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('locations.visibilityLabel')}</Text>
+            <View style={styles.typeOptionRow}>
+              {(['private', 'public'] as const).map((visibility) => {
+                const disabled = visibility === 'public' && !canCreateGlobalLocations;
+                const isSelected = newVisibility === visibility;
+
+                return (
+                  <TouchableOpacity
+                    key={visibility}
+                    style={[
+                      styles.typeOptionChip,
+                      { backgroundColor: isSelected ? theme.primary : theme.surface, borderColor: isSelected ? theme.primary : theme.border },
+                      disabled && { opacity: 0.45 },
+                    ]}
+                    onPress={() => !disabled && setNewVisibility(visibility)}
+                    disabled={disabled}
+                  >
+                    <Text style={[styles.typeOptionText, { color: isSelected ? '#fff' : (isDark ? '#d9fff1' : theme.text) }]}>{t(visibility === 'public' ? 'locations.scopePublic' : 'locations.scopePrivate')}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+            <Text style={[styles.visibilityHint, { color: theme.textSoft }]}>{t(newVisibility === 'public' ? 'locations.visibilityPublicHint' : 'locations.visibilityPrivateHint')}</Text>
 
             <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('locations.waterTypeLabel')}</Text>
             <View style={styles.typeOptionRow}>
@@ -850,6 +1061,50 @@ export default function LocationsScreen() {
         </SafeAreaView>
       </Modal>
 
+      <Modal visible={requestModal} animationType="slide">
+        <SafeAreaView style={[styles.safe, { backgroundColor: theme.background }]}> 
+          <View style={[styles.detailHeader, { backgroundColor: theme.surface, borderBottomColor: theme.borderSoft }]}> 
+            <TouchableOpacity onPress={() => setRequestModal(false)}>
+              <Text style={[styles.backBtn, { color: theme.primary }]}>‹ {t('locations.cancel')}</Text>
+            </TouchableOpacity>
+            <Text style={[styles.detailTitle, { color: theme.text }]}>{t('locations.requestTitle')}</Text>
+            <View style={{ width: 60 }} />
+          </View>
+
+          <ScrollView contentContainerStyle={{ padding: 16 }}>
+            <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('locations.locationName')}</Text>
+            <TextInput style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]} placeholder={t('locations.locationNamePlaceholder')} placeholderTextColor={theme.textSoft} value={requestName} onChangeText={setRequestName} />
+
+            <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('locations.waterTypeLabel')}</Text>
+            <View style={styles.typeOptionRow}>
+              {waterTypeOptions.map((option) => {
+                const isSelected = requestWaterType === option;
+                return (
+                  <TouchableOpacity
+                    key={option}
+                    style={[styles.typeOptionChip, { backgroundColor: isSelected ? theme.primary : theme.surface, borderColor: isSelected ? theme.primary : theme.border }]}
+                    onPress={() => setRequestWaterType(option)}
+                  >
+                    <Text style={[styles.typeOptionText, { color: isSelected ? '#fff' : (isDark ? '#d9fff1' : theme.text) }]}>{getWaterTypeLabel(option)}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            <Text style={[styles.inputLabel, { color: theme.textMuted }]}>{t('locations.requestNotesLabel')}</Text>
+            <TextInput style={[styles.input, { height: 110, backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]} placeholder={t('locations.requestNotesPlaceholder')} placeholderTextColor={theme.textSoft} value={requestDesc} onChangeText={setRequestDesc} multiline />
+
+            <TouchableOpacity
+              style={[styles.saveBtn, { backgroundColor: theme.primary }, requesting && { opacity: 0.6 }]}
+              onPress={sendLocationRequest}
+              disabled={requesting}
+            >
+              {requesting ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveBtnText}>📨 {t('locations.requestSend')}</Text>}
+            </TouchableOpacity>
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+
       <Modal visible={mapPickerVisible} animationType="slide">
         <SafeAreaView style={[styles.mapPickerSafe, { backgroundColor: theme.background }]}> 
           <View style={[styles.detailHeader, { backgroundColor: theme.surface, borderBottomColor: theme.borderSoft }]}> 
@@ -972,11 +1227,17 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 40 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 16, paddingBottom: 8, backgroundColor: '#fff', borderBottomWidth: 0.5, borderBottomColor: '#eee' },
   headerTitle: { fontSize: 18, fontWeight: '800', color: '#1a1a1a' },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   headerSpacer: { width: 84, height: 1 },
   addBtn: { backgroundColor: '#1D9E75', paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8 },
   addBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
+  requestBtn: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, borderWidth: 1 },
+  requestBtnText: { fontWeight: '700', fontSize: 12 },
   searchRow: { backgroundColor: '#fff', padding: 10, borderBottomWidth: 0.5, borderBottomColor: '#eee' },
   searchInput: { backgroundColor: '#f4f6f8', borderRadius: 10, padding: 10, fontSize: 14, color: '#1a1a1a' },
+  scopeRow: { flexDirection: 'row', gap: 8, marginTop: 10 },
+  scopeChip: { borderRadius: 999, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 8 },
+  scopeChipText: { fontSize: 12, fontWeight: '800' },
   locationCard: { backgroundColor: '#fff', borderRadius: 14, marginBottom: 10, overflow: 'hidden', flexDirection: 'row', alignItems: 'center', borderWidth: 0.5, borderColor: '#eee', padding: 10, gap: 12 },
   locationPhoto: { width: 60, height: 60, borderRadius: 10 },
   locationPhotoEmpty: { width: 60, height: 60, borderRadius: 10, backgroundColor: '#f0f0f0', alignItems: 'center', justifyContent: 'center' },
@@ -991,9 +1252,15 @@ const styles = StyleSheet.create({
   emptySubText: { fontSize: 13, color: '#aaa', marginTop: 4 },
   mapOpenButton: { borderRadius: 12, borderWidth: 1, paddingVertical: 12, paddingHorizontal: 14, marginBottom: 16 },
   mapOpenButtonText: { fontSize: 14, fontWeight: '700', textAlign: 'center' },
+  detailInfoCard: { borderRadius: 14, borderWidth: 1, padding: 14, marginBottom: 16 },
+  detailDescriptionPreview: { fontSize: 14, lineHeight: 21 },
+  descriptionButton: { marginTop: 12, borderRadius: 12, borderWidth: 1, paddingVertical: 10, paddingHorizontal: 12 },
+  descriptionButtonText: { fontSize: 13, fontWeight: '700', textAlign: 'center' },
+  descriptionFullText: { fontSize: 15, lineHeight: 24 },
   typeOptionRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
   typeOptionChip: { borderRadius: 999, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 8 },
   typeOptionText: { fontSize: 12, fontWeight: '700' },
+  visibilityHint: { fontSize: 12, lineHeight: 18, marginTop: -6, marginBottom: 4 },
   pinAdjustCard: { borderRadius: 14, borderWidth: 1, padding: 12, marginBottom: 10 },
   inlineMapTouch: { borderRadius: 16, marginTop: 4 },
   pinAdjustHeaderRow: { flexDirection: 'row', gap: 10, alignItems: 'flex-start' },

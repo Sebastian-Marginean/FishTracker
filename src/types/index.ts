@@ -64,6 +64,7 @@ export interface Rod {
   rod_number: RodNumber;
   bait_preset_id?: number;
   bait_custom?: string;
+  hook_bait?: string;
   hook_setup?: string;
   cast_count: number;
   last_cast_at?: string;
@@ -184,6 +185,7 @@ export interface LeaderboardEntry {
 export interface LocalRodState {
   rodNumber: RodNumber;
   baitName: string;
+  hookBait: string;
   hookSetup: string;
   castCount: number;
   lastCastTimestamp: number | null; // epoch ms

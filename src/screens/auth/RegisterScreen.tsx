@@ -266,7 +266,7 @@ export default function RegisterScreen({ navigation }: any) {
 
             <View style={styles.header}>
               <Text style={styles.eyebrow}>{t('auth.registerEyebrow')}</Text>
-              <Text style={styles.logo}>🪝</Text>
+              <Text style={styles.logo}>🎣</Text>
               <Text style={styles.appName}>{t('auth.registerTitle')}</Text>
               <Text style={styles.headline}>{t('auth.registerHeadline')}</Text>
               <Text style={styles.tagline}>{t('auth.registerDescription')}</Text>
@@ -282,7 +282,7 @@ export default function RegisterScreen({ navigation }: any) {
             <Text style={styles.label}>{t('auth.username')}</Text>
             <TextInput
               style={styles.input}
-              placeholder="pescar_profesionist"
+              placeholder={t('auth.usernamePlaceholder')}
               placeholderTextColor="#9AA6A0"
               value={username}
               onChangeText={setUsername}

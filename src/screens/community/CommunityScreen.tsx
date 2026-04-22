@@ -1,13 +1,14 @@
 // src/screens/community/CommunityScreen.tsx
 // Chat global + conversații private + leaderboard
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
   TextInput, FlatList, ActivityIndicator, Modal,
   KeyboardAvoidingView, Platform, Alert, Image,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useFocusEffect } from '@react-navigation/native';
 import ConfirmActionSheet from '../../components/ConfirmActionSheet';
 import SuccessSheet from '../../components/SuccessSheet';
 import { formatDate, formatDateTime, formatTime, useI18n } from '../../i18n';
@@ -22,6 +23,7 @@ import type { LeaderboardEntry, Message, PrivateMessage, SearchProfileResult } f
 type Tab = 'chat' | 'private' | 'leaderboard';
 type ModerationKind = 'mute' | 'ban';
 type ModerationDuration = '1h' | '24h' | '7d' | '30d' | 'permanent';
+type LeaderboardPeriod = 'week' | 'month' | 'year' | 'all';
 
 interface ConversationPreview {
   conversationId: string;
@@ -68,6 +70,12 @@ interface SuccessState {
   variant?: 'success' | 'warning';
 }
 
+interface TypingUser {
+  userId: string;
+  label: string;
+  expiresAt: number;
+}
+
 export default function CommunityScreen() {
   const insets = useSafeAreaInsets();
   const { user, profile } = useAuthStore();
@@ -85,6 +93,7 @@ export default function CommunityScreen() {
   const [loadingChat, setLoadingChat] = useState(true);
   const [loadingBoard, setLoadingBoard] = useState(true);
   const [lbFilter, setLbFilter] = useState<'total_catches' | 'biggest_fish_kg' | 'total_weight_kg'>('total_catches');
+  const [lbPeriod, setLbPeriod] = useState<LeaderboardPeriod>('month');
   const [privateSearch, setPrivateSearch] = useState('');
   const [searchResults, setSearchResults] = useState<SearchProfileResult[]>([]);
   const [searchingProfiles, setSearchingProfiles] = useState(false);
@@ -107,9 +116,15 @@ export default function CommunityScreen() {
   const [moderatingProfile, setModeratingProfile] = useState(false);
   const [updatingAdminRole, setUpdatingAdminRole] = useState(false);
   const [successState, setSuccessState] = useState<SuccessState | null>(null);
+  const [globalTypingUsers, setGlobalTypingUsers] = useState<TypingUser[]>([]);
+  const [privateTypingUsers, setPrivateTypingUsers] = useState<TypingUser[]>([]);
   const scrollRef = useRef<ScrollView>(null);
   const privateScrollRef = useRef<ScrollView>(null);
   const channelRef = useRef<any>(null);
+  const globalTypingChannelRef = useRef<any>(null);
+  const privateTypingChannelRef = useRef<any>(null);
+  const globalTypingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const privateTypingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const keyboardBehavior = Platform.OS === 'ios' ? 'padding' : 'height';
 
   const canManageMessage = (messageUserId?: string) => !!user?.id && (messageUserId === user.id || isAdmin);
@@ -181,6 +196,60 @@ export default function CommunityScreen() {
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
   };
 
+  const getTypingText = (users: TypingUser[]) => {
+    if (users.length === 0) return null;
+    if (users.length === 1) return t('community.typingOne', { name: users[0].label });
+    if (users.length === 2) return t('community.typingTwo', { first: users[0].label, second: users[1].label });
+    return t('community.typingMany');
+  };
+
+  const broadcastGlobalTyping = useCallback((isTyping: boolean) => {
+    if (!globalTypingChannelRef.current || !user?.id) return;
+    void globalTypingChannelRef.current.send({
+      type: 'broadcast',
+      event: 'typing',
+      payload: {
+        userId: user.id,
+        username: profile?.username ?? null,
+        fullName: profile?.full_name ?? null,
+        isTyping,
+      },
+    });
+  }, [profile?.full_name, profile?.username, user?.id]);
+
+  const broadcastPrivateTyping = useCallback((isTyping: boolean) => {
+    if (!privateTypingChannelRef.current || !user?.id || !selectedConversationId) return;
+    void privateTypingChannelRef.current.send({
+      type: 'broadcast',
+      event: 'typing',
+      payload: {
+        userId: user.id,
+        username: profile?.username ?? null,
+        fullName: profile?.full_name ?? null,
+        isTyping,
+        conversationId: selectedConversationId,
+      },
+    });
+  }, [profile?.full_name, profile?.username, selectedConversationId, user?.id]);
+
+  const handleGlobalMessageChange = (value: string) => {
+    setMessageText(value);
+    broadcastGlobalTyping(!!value.trim());
+    if (globalTypingTimeoutRef.current) clearTimeout(globalTypingTimeoutRef.current);
+    globalTypingTimeoutRef.current = setTimeout(() => {
+      broadcastGlobalTyping(false);
+    }, 1800);
+  };
+
+  const handlePrivateMessageChange = (value: string) => {
+    setPrivateMessageText(value);
+    broadcastPrivateTyping(!!value.trim());
+    if (privateTypingTimeoutRef.current) clearTimeout(privateTypingTimeoutRef.current);
+    privateTypingTimeoutRef.current = setTimeout(() => {
+      broadcastPrivateTyping(false);
+    }, 1800);
+  };
+
   useEffect(() => {
     void fetchMessages();
     void fetchLeaderboard();
@@ -197,21 +266,146 @@ export default function CommunityScreen() {
   useEffect(() => {
     if (activeTab === 'leaderboard') void fetchLeaderboard();
     if (activeTab === 'private') void fetchPrivateConversations();
-  }, [activeTab]);
+  }, [activeTab, lbPeriod]);
+
+  const getLeaderboardWindowStart = (period: LeaderboardPeriod) => {
+    if (period === 'all') return null;
+
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+
+    if (period === 'week') {
+      start.setDate(start.getDate() - 6);
+      return start;
+    }
+
+    if (period === 'month') {
+      start.setDate(1);
+      return start;
+    }
+
+    start.setMonth(0, 1);
+    return start;
+  };
 
   useEffect(() => {
     if (selectedConversationId) void fetchPrivateMessages(selectedConversationId);
   }, [selectedConversationId]);
 
-  const fetchMessages = async () => {
-    setLoadingChat(true);
+  useEffect(() => {
+    const cleanup = setInterval(() => {
+      setGlobalTypingUsers((prev) => prev.filter((item) => item.expiresAt > Date.now()));
+      setPrivateTypingUsers((prev) => prev.filter((item) => item.expiresAt > Date.now()));
+    }, 1000);
+
+    return () => clearInterval(cleanup);
+  }, []);
+
+  useEffect(() => {
+    if (globalTypingChannelRef.current) {
+      void supabase.removeChannel(globalTypingChannelRef.current);
+      globalTypingChannelRef.current = null;
+    }
+
+    globalTypingChannelRef.current = supabase
+      .channel('community-global-typing')
+      .on('broadcast', { event: 'typing' }, ({ payload }) => {
+        const nextUserId = String(payload?.userId ?? '');
+        if (!nextUserId || nextUserId === user?.id) return;
+
+        const label = getDisplayName(payload?.fullName, payload?.username, 'anonim');
+        const isTyping = !!payload?.isTyping;
+        setGlobalTypingUsers((prev) => {
+          const filtered = prev.filter((item) => item.userId !== nextUserId && item.expiresAt > Date.now());
+          if (!isTyping) return filtered;
+          return [...filtered, { userId: nextUserId, label, expiresAt: Date.now() + 3500 }];
+        });
+      })
+      .subscribe();
+
+    return () => {
+      if (globalTypingTimeoutRef.current) clearTimeout(globalTypingTimeoutRef.current);
+      if (globalTypingChannelRef.current) {
+        void supabase.removeChannel(globalTypingChannelRef.current);
+        globalTypingChannelRef.current = null;
+      }
+    };
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (privateTypingChannelRef.current) {
+      void supabase.removeChannel(privateTypingChannelRef.current);
+      privateTypingChannelRef.current = null;
+    }
+    setPrivateTypingUsers([]);
+
+    if (!selectedConversationId) return;
+
+    privateTypingChannelRef.current = supabase
+      .channel(`community-private-typing-${selectedConversationId}`)
+      .on('broadcast', { event: 'typing' }, ({ payload }) => {
+        const nextUserId = String(payload?.userId ?? '');
+        if (!nextUserId || nextUserId === user?.id) return;
+
+        const label = getDisplayName(payload?.fullName, payload?.username, 'anonim');
+        const isTyping = !!payload?.isTyping;
+        setPrivateTypingUsers((prev) => {
+          const filtered = prev.filter((item) => item.userId !== nextUserId && item.expiresAt > Date.now());
+          if (!isTyping) return filtered;
+          return [...filtered, { userId: nextUserId, label, expiresAt: Date.now() + 3500 }];
+        });
+      })
+      .subscribe();
+
+    return () => {
+      if (privateTypingTimeoutRef.current) clearTimeout(privateTypingTimeoutRef.current);
+      if (privateTypingChannelRef.current) {
+        void supabase.removeChannel(privateTypingChannelRef.current);
+        privateTypingChannelRef.current = null;
+      }
+    };
+  }, [selectedConversationId, user?.id]);
+
+  useEffect(() => {
+    if (activeTab !== 'chat') return;
+
+    const interval = setInterval(() => {
+      void fetchMessages(true);
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [activeTab, user?.id]);
+
+  useEffect(() => {
+    if (activeTab !== 'private' || !selectedConversationId) return;
+
+    const interval = setInterval(() => {
+      void fetchPrivateMessages(selectedConversationId, true);
+      void fetchPrivateConversations(true);
+      refreshUnread();
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [activeTab, refreshUnread, selectedConversationId, user?.id]);
+
+  useFocusEffect(
+    useCallback(() => {
+      void fetchMessages();
+      void fetchLeaderboard();
+      void fetchPrivateConversations();
+      if (selectedConversationId) void fetchPrivateMessages(selectedConversationId);
+    }, [selectedConversationId, lbPeriod, user?.id])
+  );
+
+  const fetchMessages = async (silent = false) => {
+    if (!silent) setLoadingChat(true);
     const { data } = await supabase
       .from('messages')
       .select('id, user_id, content, media_url, created_at, profiles:profiles!messages_user_id_fkey(username, full_name, avatar_url)')
       .order('created_at', { ascending: true })
       .limit(60);
     if (data) setMessages(data);
-    setLoadingChat(false);
+    if (!silent) setLoadingChat(false);
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: false }), 200);
   };
 
@@ -229,32 +423,37 @@ export default function CommunityScreen() {
     setLoadingBoard(true);
     setLeaderboardError(null);
 
-    const rpcResult = await supabase.rpc('get_leaderboard_monthly');
-    if (!rpcResult.error && rpcResult.data) {
-      setLeaderboard(normalizeLeaderboardRows(rpcResult.data).slice(0, 20));
-      setLoadingBoard(false);
-      return;
+    if (lbPeriod === 'month') {
+      const rpcResult = await supabase.rpc('get_leaderboard_monthly');
+      if (!rpcResult.error && rpcResult.data) {
+        setLeaderboard(normalizeLeaderboardRows(rpcResult.data).slice(0, 20));
+        setLoadingBoard(false);
+        return;
+      }
+
+      const viewResult = await supabase.from('leaderboard_monthly').select('*').limit(20);
+      if (!viewResult.error && viewResult.data) {
+        setLeaderboard(normalizeLeaderboardRows(viewResult.data));
+        setLoadingBoard(false);
+        return;
+      }
     }
 
-    const viewResult = await supabase.from('leaderboard_monthly').select('*').limit(20);
-    if (!viewResult.error && viewResult.data) {
-      setLeaderboard(normalizeLeaderboardRows(viewResult.data));
-      setLoadingBoard(false);
-      return;
-    }
+    const startDate = getLeaderboardWindowStart(lbPeriod);
 
-    const startOfMonth = new Date();
-    startOfMonth.setDate(1);
-    startOfMonth.setHours(0, 0, 0, 0);
-
-    const fallback = await supabase
+    let fallbackQuery = supabase
       .from('catches')
       .select('id, user_id, weight_kg, session_id, caught_at, profiles:profiles!catches_user_id_fkey(username, avatar_url)')
-      .gte('caught_at', startOfMonth.toISOString())
       .order('caught_at', { ascending: false });
 
+    if (startDate) {
+      fallbackQuery = fallbackQuery.gte('caught_at', startDate.toISOString());
+    }
+
+    const fallback = await fallbackQuery;
+
     if (fallback.error || !fallback.data) {
-      const message = rpcResult.error?.message || viewResult.error?.message || fallback.error?.message || t('common.unknown');
+      const message = fallback.error?.message || t('common.unknown');
       setLeaderboard([]);
       setLeaderboardError(message);
       setLoadingBoard(false);
@@ -287,14 +486,14 @@ export default function CommunityScreen() {
     setLoadingBoard(false);
   };
 
-  const fetchPrivateConversations = async () => {
+  const fetchPrivateConversations = async (silent = false) => {
     if (!user?.id) {
       setConversationList([]);
       setLoadingPrivate(false);
       return;
     }
 
-    setLoadingPrivate(true);
+    if (!silent) setLoadingPrivate(true);
     const { data: memberRows } = await supabase
       .from('private_conversation_members')
       .select('conversation_id, last_read_at')
@@ -302,7 +501,7 @@ export default function CommunityScreen() {
 
     if (!memberRows?.length) {
       setConversationList([]);
-      setLoadingPrivate(false);
+      if (!silent) setLoadingPrivate(false);
       return;
     }
 
@@ -357,11 +556,11 @@ export default function CommunityScreen() {
     });
 
     setConversationList(nextConversationList);
-    setLoadingPrivate(false);
+    if (!silent) setLoadingPrivate(false);
   };
 
-  const fetchPrivateMessages = async (conversationId: string) => {
-    setLoadingPrivateMessages(true);
+  const fetchPrivateMessages = async (conversationId: string, silent = false) => {
+    if (!silent) setLoadingPrivateMessages(true);
     const { data } = await supabase
       .from('private_messages')
       .select('id, conversation_id, user_id, content, media_url, created_at, profiles:profiles!private_messages_user_id_fkey(username, avatar_url)')
@@ -373,18 +572,18 @@ export default function CommunityScreen() {
       setPrivateMessages(data as any);
       setTimeout(() => privateScrollRef.current?.scrollToEnd({ animated: false }), 120);
     }
-    await markPrivateConversationAsRead(conversationId);
-    setLoadingPrivateMessages(false);
+    await markPrivateConversationAsRead(conversationId, true);
+    if (!silent) setLoadingPrivateMessages(false);
   };
 
-  const markPrivateConversationAsRead = async (conversationId: string) => {
+  const markPrivateConversationAsRead = async (conversationId: string, silent = false) => {
     if (!user?.id) return;
     await supabase
       .from('private_conversation_members')
       .update({ last_read_at: new Date().toISOString() })
       .eq('conversation_id', conversationId)
       .eq('user_id', user.id);
-    await fetchPrivateConversations();
+    await fetchPrivateConversations(silent);
     refreshUnread();
   };
 
@@ -420,8 +619,8 @@ export default function CommunityScreen() {
     setSelectedConversationId(conversationId);
     setPrivateSearch('');
     setSearchResults([]);
-    await fetchPrivateConversations();
-    await fetchPrivateMessages(conversationId);
+    await fetchPrivateConversations(true);
+    await fetchPrivateMessages(conversationId, true);
   };
 
   const openPublicProfile = async (targetUser: PublicProfileSheetState) => {
@@ -565,6 +764,7 @@ export default function CommunityScreen() {
     const content = messageText.trim();
     const editingId = editingGlobalMessage?.id;
     setMessageText('');
+    broadcastGlobalTyping(false);
 
     if (editingId) {
       const { error } = await supabase
@@ -584,7 +784,7 @@ export default function CommunityScreen() {
       }
 
       setEditingGlobalMessage(null);
-      await fetchMessages();
+      await fetchMessages(true);
       return;
     }
 
@@ -613,6 +813,7 @@ export default function CommunityScreen() {
     const content = privateMessageText.trim();
     const editingId = editingPrivateMessage?.id;
     setPrivateMessageText('');
+    broadcastPrivateTyping(false);
 
     if (editingId) {
       const { error } = await supabase
@@ -632,8 +833,8 @@ export default function CommunityScreen() {
       }
 
       setEditingPrivateMessage(null);
-      await fetchPrivateMessages(selectedConversationId);
-      await fetchPrivateConversations();
+      await fetchPrivateMessages(selectedConversationId, true);
+      await fetchPrivateConversations(true);
       refreshUnread();
       return;
     }
@@ -655,8 +856,8 @@ export default function CommunityScreen() {
       return;
     }
 
-    await fetchPrivateMessages(selectedConversationId);
-    await fetchPrivateConversations();
+    await fetchPrivateMessages(selectedConversationId, true);
+    await fetchPrivateConversations(true);
   };
 
   const deleteGlobalMessage = async (messageId: string) => {
@@ -670,7 +871,7 @@ export default function CommunityScreen() {
       setEditingGlobalMessage(null);
       setMessageText('');
     }
-    await fetchMessages();
+    await fetchMessages(true);
   };
 
   const deletePrivateMessage = async (messageId: string) => {
@@ -685,9 +886,9 @@ export default function CommunityScreen() {
       setPrivateMessageText('');
     }
     if (selectedConversationId) {
-      await fetchPrivateMessages(selectedConversationId);
+      await fetchPrivateMessages(selectedConversationId, true);
     }
-    await fetchPrivateConversations();
+    await fetchPrivateConversations(true);
     refreshUnread();
   };
 
@@ -761,22 +962,30 @@ export default function CommunityScreen() {
           }
         }
 
-        void fetchMessages();
+        void fetchMessages(true);
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'catches' }, () => {
         void fetchLeaderboard();
       })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, () => {
+        void fetchMessages(true);
+        void fetchPrivateConversations(true);
+        void fetchLeaderboard();
+        if (selectedConversationId) {
+          void fetchPrivateMessages(selectedConversationId, true);
+        }
+      })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'private_messages' }, (payload) => {
         const nextRow = ((payload.new as { conversation_id?: string })?.conversation_id ? payload.new : payload.old) as { conversation_id?: string };
         const conversationId = String(nextRow?.conversation_id ?? '');
-        void fetchPrivateConversations();
+        void fetchPrivateConversations(true);
         if (selectedConversationId && (!conversationId || conversationId === selectedConversationId)) {
-          void fetchPrivateMessages(selectedConversationId);
+          void fetchPrivateMessages(selectedConversationId, true);
         }
         refreshUnread();
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'private_conversation_members' }, () => {
-        void fetchPrivateConversations();
+        void fetchPrivateConversations(true);
       })
       .subscribe();
   };
@@ -794,6 +1003,13 @@ export default function CommunityScreen() {
     biggest_fish_kg: t('community.metricByBiggest'),
     total_weight_kg: t('community.metricByWeight'),
   };
+
+  const periodLabel = {
+    week: t('community.periodWeek'),
+    month: t('community.periodMonth'),
+    year: t('community.periodYear'),
+    all: t('community.periodAll'),
+  } satisfies Record<LeaderboardPeriod, string>;
 
   const selectedConversation = conversationList.find((item) => item.conversationId === selectedConversationId) ?? null;
   const totalPrivateUnread = conversationList.reduce((sum, item) => sum + item.unreadCount, 0);
@@ -857,10 +1073,13 @@ export default function CommunityScreen() {
           )}
 
           <View style={[styles.chatInput, { backgroundColor: theme.surface, borderTopColor: theme.borderSoft, paddingBottom: Math.max(insets.bottom, 10) }]}> 
-            <TextInput style={[styles.chatTextInput, { backgroundColor: theme.inputBg, color: theme.text }]} placeholder={editingGlobalMessage ? t('community.messagePlaceholderEdit') : t('community.messagePlaceholder')} placeholderTextColor={theme.textSoft} value={messageText} onChangeText={setMessageText} onSubmitEditing={sendMessage} returnKeyType="send" multiline maxLength={500} />
-            <TouchableOpacity style={[styles.sendBtn, { backgroundColor: theme.primary }, !messageText.trim() && { opacity: 0.4 }]} onPress={sendMessage} disabled={!messageText.trim()}>
-              <Text style={styles.sendBtnText}>{editingGlobalMessage ? '✓' : '↑'}</Text>
-            </TouchableOpacity>
+            {!!getTypingText(globalTypingUsers) && <Text style={[styles.typingBarText, { color: theme.textSoft }]}>{getTypingText(globalTypingUsers)}</Text>}
+            <View style={styles.chatInputRow}>
+              <TextInput style={[styles.chatTextInput, { backgroundColor: theme.inputBg, color: theme.text }]} placeholder={editingGlobalMessage ? t('community.messagePlaceholderEdit') : t('community.messagePlaceholder')} placeholderTextColor={theme.textSoft} value={messageText} onChangeText={handleGlobalMessageChange} onSubmitEditing={sendMessage} returnKeyType="send" multiline maxLength={500} />
+              <TouchableOpacity style={[styles.sendBtn, { backgroundColor: theme.primary }, !messageText.trim() && { opacity: 0.4 }]} onPress={sendMessage} disabled={!messageText.trim()}>
+                <Text style={styles.sendBtnText}>{editingGlobalMessage ? '✓' : '↑'}</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </KeyboardAvoidingView>
       )}
@@ -924,10 +1143,13 @@ export default function CommunityScreen() {
               )}
 
               <View style={[styles.chatInput, { backgroundColor: theme.surface, borderTopColor: theme.borderSoft, paddingBottom: Math.max(insets.bottom, 10) }]}> 
-                <TextInput style={[styles.chatTextInput, { backgroundColor: theme.inputBg, color: theme.text }]} placeholder={editingPrivateMessage ? t('community.privateMessagePlaceholderEdit') : t('community.privateMessagePlaceholder')} placeholderTextColor={theme.textSoft} value={privateMessageText} onChangeText={setPrivateMessageText} onSubmitEditing={sendPrivateMessage} returnKeyType="send" multiline maxLength={500} />
-                <TouchableOpacity style={[styles.sendBtn, { backgroundColor: theme.primary }, !privateMessageText.trim() && { opacity: 0.4 }]} onPress={sendPrivateMessage} disabled={!privateMessageText.trim()}>
-                  <Text style={styles.sendBtnText}>{editingPrivateMessage ? '✓' : '↑'}</Text>
-                </TouchableOpacity>
+                {!!getTypingText(privateTypingUsers) && <Text style={[styles.typingBarText, { color: theme.textSoft }]}>{getTypingText(privateTypingUsers)}</Text>}
+                <View style={styles.chatInputRow}>
+                  <TextInput style={[styles.chatTextInput, { backgroundColor: theme.inputBg, color: theme.text }]} placeholder={editingPrivateMessage ? t('community.privateMessagePlaceholderEdit') : t('community.privateMessagePlaceholder')} placeholderTextColor={theme.textSoft} value={privateMessageText} onChangeText={handlePrivateMessageChange} onSubmitEditing={sendPrivateMessage} returnKeyType="send" multiline maxLength={500} />
+                  <TouchableOpacity style={[styles.sendBtn, { backgroundColor: theme.primary }, !privateMessageText.trim() && { opacity: 0.4 }]} onPress={sendPrivateMessage} disabled={!privateMessageText.trim()}>
+                    <Text style={styles.sendBtnText}>{editingPrivateMessage ? '✓' : '↑'}</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
             </>
           ) : loadingPrivate ? (
@@ -968,9 +1190,24 @@ export default function CommunityScreen() {
       {activeTab === 'leaderboard' && (
         <View style={{ flex: 1 }}>
           <View style={[styles.lbHero, { backgroundColor: theme.surface, borderBottomColor: theme.borderSoft }]}> 
-            <Text style={[styles.lbHeroEyebrow, { color: theme.textSoft }]}>{t('community.monthlyLeaderboard')}</Text>
+            <Text style={[styles.lbHeroEyebrow, { color: theme.textSoft }]}>{t('community.leaderboardPeriodTitle', { period: periodLabel[lbPeriod] })}</Text>
             <Text style={[styles.lbHeroTitle, { color: theme.text }]}>{t('community.topAnglers')}</Text>
             <Text style={[styles.lbHeroSub, { color: theme.textMuted }]}>{metricPreview[lbFilter]}</Text>
+            <View style={styles.lbPeriodRow}>
+              {(['week', 'month', 'year', 'all'] as const).map((period) => (
+                <TouchableOpacity
+                  key={period}
+                  style={[
+                    styles.lbPeriodChip,
+                    { backgroundColor: theme.surfaceAlt, borderColor: theme.border },
+                    lbPeriod === period && { backgroundColor: theme.primary, borderColor: theme.primary },
+                  ]}
+                  onPress={() => setLbPeriod(period)}
+                >
+                  <Text style={[styles.lbPeriodText, { color: lbPeriod === period ? '#fff' : theme.text }]}>{periodLabel[period]}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
             <View style={styles.filterDeck}>
               {(Object.keys(filterLabel) as (keyof typeof filterLabel)[]).map((key) => (
                 <TouchableOpacity key={key} style={[styles.filterChip, { backgroundColor: theme.surfaceAlt, borderColor: theme.border }, lbFilter === key && styles.filterChipActive, lbFilter === key && { backgroundColor: theme.primaryStrong, borderColor: theme.primaryStrong }]} onPress={() => setLbFilter(key as any)}>
@@ -988,7 +1225,7 @@ export default function CommunityScreen() {
             <View style={styles.center}><ActivityIndicator color={theme.primary} /></View>
           ) : sortedLeaderboard.length === 0 ? (
             <View style={styles.center}>
-              <Text style={[styles.emptyText, { color: theme.textSoft }]}>{leaderboardError ? t('community.leaderboardLoadFailed') : t('community.noMonthlyCatches')}</Text>
+              <Text style={[styles.emptyText, { color: theme.textSoft }]}>{leaderboardError ? t('community.leaderboardLoadFailed') : t('community.noLeaderboardCatches', { period: periodLabel[lbPeriod].toLowerCase() })}</Text>
               {!!leaderboardError && <Text style={[styles.lbErrorText, { color: theme.dangerText }]}>{leaderboardError}</Text>}
             </View>
           ) : (
@@ -1272,8 +1509,10 @@ const styles = StyleSheet.create({
   editingAccent: { width: 4, alignSelf: 'stretch', borderRadius: 999 },
   editingTitle: { fontSize: 13, fontWeight: '800' },
   editingPreview: { fontSize: 12, marginTop: 3, lineHeight: 18 },
-  chatInput: { flexDirection: 'row', gap: 8, padding: 10, backgroundColor: '#fff', borderTopWidth: 0.5, borderTopColor: '#eee', alignItems: 'flex-end' },
+  chatInput: { gap: 8, padding: 10, backgroundColor: '#fff', borderTopWidth: 0.5, borderTopColor: '#eee' },
   editingCancel: { fontSize: 12, fontWeight: '800' },
+  chatInputRow: { flexDirection: 'row', gap: 8, alignItems: 'flex-end' },
+  typingBarText: { fontSize: 11, fontWeight: '600', paddingHorizontal: 6, minHeight: 16 },
   chatTextInput: { flex: 1, backgroundColor: '#f4f6f8', borderRadius: 20, paddingHorizontal: 14, paddingVertical: 10, fontSize: 14, color: '#1a1a1a', maxHeight: 100 },
   sendBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#1D9E75', alignItems: 'center', justifyContent: 'center' },
   sendBtnText: { color: '#fff', fontSize: 20, fontWeight: '700' },
@@ -1299,6 +1538,9 @@ const styles = StyleSheet.create({
   lbHeroEyebrow: { fontSize: 10, color: '#7a8794', fontWeight: '800', letterSpacing: 1.1 },
   lbHeroTitle: { fontSize: 22, fontWeight: '900', color: '#12212d', marginTop: 4 },
   lbHeroSub: { fontSize: 13, color: '#667281', marginTop: 2 },
+  lbPeriodRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 14 },
+  lbPeriodChip: { minHeight: 36, paddingHorizontal: 14, borderRadius: 999, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  lbPeriodText: { fontSize: 12, fontWeight: '800' },
   filterDeck: { flexDirection: 'row', gap: 8, marginTop: 14 },
   filterChip: { flex: 1, minHeight: 88, paddingHorizontal: 10, paddingVertical: 12, borderRadius: 16, backgroundColor: '#f4f7f8', borderWidth: 1, borderColor: '#e6ebee' },
   filterChipActive: { backgroundColor: '#153f37', borderColor: '#153f37' },

@@ -50,6 +50,7 @@ interface HistoryRodRow {
   session_id: string;
   rod_number: number;
   bait_custom?: string | null;
+  hook_bait?: string | null;
   hook_setup?: string | null;
   cast_count: number;
   catch_count: number;
@@ -73,6 +74,7 @@ interface HistorySetupRow {
   rod_id?: string | null;
   rod_number: number;
   bait_name?: string | null;
+  hook_bait?: string | null;
   hook_setup?: string | null;
   created_at: string;
 }
@@ -162,6 +164,7 @@ function findSetupForCatch(catchTime: string, rod: HistoryRodRow, setupHistory: 
 
   return {
     bait: latestEntry?.bait_name?.trim() || rod.bait_custom?.trim() || '',
+    hookBait: latestEntry?.hook_bait?.trim() || rod.hook_bait?.trim() || '',
     hook: latestEntry?.hook_setup?.trim() || rod.hook_setup?.trim() || '',
   };
 }
@@ -187,6 +190,7 @@ export default function DashboardScreen() {
   const [selectedCatchGroupId, setSelectedCatchGroupId] = useState<string | null>(null);
   const [successState, setSuccessState] = useState<SuccessState | null>(null);
   const [baitInput, setBaitInput] = useState('');
+  const [hookBaitInput, setHookBaitInput] = useState('');
   const [hookInput, setHookInput] = useState('');
   const [historyModalVisible, setHistoryModalVisible] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -284,7 +288,7 @@ export default function DashboardScreen() {
     const [rodsRes, catchesRes, setupHistoryRes] = await Promise.all([
       supabase
         .from('rods')
-        .select('id, session_id, rod_number, bait_custom, hook_setup, cast_count, catch_count, updated_at, last_cast_at')
+        .select('id, session_id, rod_number, bait_custom, hook_bait, hook_setup, cast_count, catch_count, updated_at, last_cast_at')
         .in('session_id', sessionIds)
         .order('rod_number', { ascending: true }),
       supabase
@@ -294,7 +298,7 @@ export default function DashboardScreen() {
         .order('caught_at', { ascending: false }),
         supabase
         .from('rod_setup_history')
-        .select('id, session_id, rod_id, rod_number, bait_name, hook_setup, created_at')
+        .select('id, session_id, rod_id, rod_number, bait_name, hook_bait, hook_setup, created_at')
         .in('session_id', sessionIds)
         .order('created_at', { ascending: true }),
     ]);
@@ -360,6 +364,19 @@ export default function DashboardScreen() {
     if (!isFocused) return;
     void fetchSessionLocations();
   }, [isFocused]);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel('dashboard-locations-live')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'locations' }, () => {
+        void fetchSessionLocations();
+      })
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, []);
 
   useEffect(() => {
     if (!user?.id) return;
@@ -776,6 +793,7 @@ export default function DashboardScreen() {
                     ) : isActive ? (
                       <TouchableOpacity onPress={() => {
                         setBaitInput('');
+                        setHookBaitInput('');
                         setHookInput('');
                         setEditingRod(rodNum);
                       }}>
@@ -820,6 +838,9 @@ export default function DashboardScreen() {
               {rod?.hookSetup ? (
                 <Text style={[styles.hookText, { color: theme.textMuted }]}>🪝 {rod.hookSetup}</Text>
               ) : null}
+              {rod?.hookBait ? (
+                <Text style={[styles.hookText, { color: theme.textMuted }]}>{t('dashboard.hookBaitInline', { value: rod.hookBait })}</Text>
+              ) : null}
 
               {/* Butoane */}
               {isActive && (
@@ -853,6 +874,7 @@ export default function DashboardScreen() {
                   </TouchableOpacity>
                   <TouchableOpacity style={[styles.editBtn, { backgroundColor: isDark ? theme.surfaceAlt : '#f5f5f5' }]} onPress={() => {
                     setBaitInput(rod?.baitName ?? '');
+                    setHookBaitInput(rod?.hookBait ?? '');
                     setHookInput(rod?.hookSetup ?? '');
                     setEditingRod(rodNum);
                   }}>
@@ -934,6 +956,15 @@ export default function DashboardScreen() {
               onChangeText={setBaitInput}
               returnKeyType="next"
             />
+            <Text style={[styles.modalLabel, { color: theme.textMuted }]}>{t('dashboard.hookBaitType')}</Text>
+            <TextInput
+              style={[styles.modalInput, { borderColor: theme.border, color: theme.text, backgroundColor: theme.inputBg }]}
+              placeholder={t('dashboard.hookBaitPlaceholder')}
+              placeholderTextColor={theme.textSoft}
+              value={hookBaitInput}
+              onChangeText={setHookBaitInput}
+              returnKeyType="next"
+            />
             <Text style={[styles.modalLabel, { color: theme.textMuted }]}>{t('dashboard.hookSetup')}</Text>
             <TextInput
               style={[styles.modalInput, { borderColor: theme.border, color: theme.text, backgroundColor: theme.inputBg }]}
@@ -949,7 +980,7 @@ export default function DashboardScreen() {
               </TouchableOpacity>
               <TouchableOpacity style={[styles.modalConfirm, { backgroundColor: theme.primary }]} onPress={async () => {
                 if (editingRod) {
-                  await saveRodSetup(editingRod, { baitName: baitInput, hookSetup: hookInput }, user?.id);
+                  await saveRodSetup(editingRod, { baitName: baitInput, hookBait: hookBaitInput, hookSetup: hookInput }, user?.id);
                   await loadSessionHistory();
                 }
                 setEditingRod(null);
@@ -1338,6 +1369,8 @@ export default function DashboardScreen() {
                 const rodSetupHistory = selectedHistorySession.setupHistory.filter((item) => item.rod_number === rod.rod_number);
                 const rodCatches = selectedHistorySession.catches.filter((item) => item.rod_id === rod.id).sort((left, right) => new Date(right.caught_at).getTime() - new Date(left.caught_at).getTime());
                 const fallbackBait = rod.bait_custom?.trim();
+                const fallbackHookBait = rod.hook_bait?.trim();
+                const fallbackHook = rod.hook_setup?.trim();
 
                 return (
                   <View key={rod.id} style={[styles.historyRodDetailCard, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
@@ -1353,15 +1386,20 @@ export default function DashboardScreen() {
                         <View key={entry.id} style={[styles.historyTimelineRow, styles.historySetupRow, { borderTopColor: theme.borderSoft, borderLeftColor: isDark ? theme.primary : 'rgba(29,158,117,0.35)' }]}> 
                           <Text style={[styles.historyTimelineTime, { color: isDark ? theme.primary : theme.primaryStrong }]}>{formatDateTime(language, entry.created_at)}</Text>
                           <Text style={[styles.historyTimelineTitle, { color: theme.text }]}>{entry.bait_name?.trim() || t('dashboard.historyNoBaitValue')}</Text>
+                          <Text style={[styles.historyTimelineMeta, { color: theme.textMuted }]}>{t('dashboard.historyHookBait', { value: entry.hook_bait?.trim() || t('dashboard.historyNoHookBaitValue') })}</Text>
                           <Text style={[styles.historyTimelineMeta, { color: theme.textMuted }]}>{t('dashboard.historyHook', { value: entry.hook_setup?.trim() || t('dashboard.historyNoHookValue') })}</Text>
                         </View>
                       )) : (
                         <View style={[styles.historyFallbackBox, { backgroundColor: theme.surface, borderColor: theme.borderSoft }]}> 
-                          <Text style={[styles.historyFallbackText, { color: theme.textMuted }]}> 
-                            {fallbackBait
-                              ? t('dashboard.historyFallbackBaitOnly', { bait: fallbackBait })
-                              : t('dashboard.historyNoBaits')}
-                          </Text>
+                          {fallbackBait || fallbackHookBait || fallbackHook ? (
+                            <>
+                              {fallbackBait ? <Text style={[styles.historyFallbackText, { color: theme.textMuted }]}>{t('dashboard.historyBait', { value: fallbackBait })}</Text> : null}
+                              {fallbackHookBait ? <Text style={[styles.historyFallbackText, { color: theme.textMuted }]}>{t('dashboard.historyHookBait', { value: fallbackHookBait })}</Text> : null}
+                              {fallbackHook ? <Text style={[styles.historyFallbackText, { color: theme.textMuted }]}>{t('dashboard.historyHook', { value: fallbackHook })}</Text> : null}
+                            </>
+                          ) : (
+                            <Text style={[styles.historyFallbackText, { color: theme.textMuted }]}>{t('dashboard.historyNoBaits')}</Text>
+                          )}
                         </View>
                       )}
                     </View>
@@ -1374,15 +1412,15 @@ export default function DashboardScreen() {
                         const fishWeight = item.weight_kg ? ` · ${Number(item.weight_kg).toFixed(2)} kg` : '';
                         const catchSetup = findSetupForCatch(item.caught_at, rod, rodSetupHistory);
                         const catchSetupLabel = catchSetup.bait
-                          ? t('dashboard.historyCatchSetup', { bait: catchSetup.bait, hook: catchSetup.hook || t('dashboard.historyNoHookValue') })
+                          ? t('dashboard.historyCatchSetup', { bait: catchSetup.bait, hookBait: catchSetup.hookBait || t('dashboard.historyNoHookBaitValue'), hook: catchSetup.hook || t('dashboard.historyNoHookValue') })
                           : t('dashboard.historyCatchNoSetup');
 
                         return (
                           <View key={item.id} style={[styles.historyTimelineRow, styles.historyCatchDetailRow, { borderTopColor: theme.border }]}> 
                             <Text style={[styles.historyTimelineTime, { color: theme.textSoft }]}>{formatDateTime(language, item.caught_at)}</Text>
                             <Text style={[styles.historyTimelineTitle, { color: theme.text }]}>{`${fishName}${fishWeight}`}</Text>
-                            <Text style={[styles.historyTimelineMeta, { color: theme.textMuted }]}>{t('dashboard.historyCatchMeta', { rod: rod.rod_number, time: formatDateTime(language, item.caught_at) })}</Text>
-                            <Text style={[styles.historyTimelineMeta, { color: theme.textMuted }]}>{catchSetupLabel}</Text>
+                            <Text style={[styles.historyTimelineMeta, { color: isDark ? theme.text : theme.textMuted }]}>{t('dashboard.historyCatchMeta', { rod: rod.rod_number, time: formatDateTime(language, item.caught_at) })}</Text>
+                            <Text style={[styles.historyTimelineMeta, { color: isDark ? theme.text : theme.textMuted }]}>{catchSetupLabel}</Text>
                           </View>
                         );
                       }) : (

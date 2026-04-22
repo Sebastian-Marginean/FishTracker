@@ -50,7 +50,10 @@ type AdminTab = 'locations' | 'catches' | 'groups' | 'messages' | 'users';
 type ModerationKind = 'mute' | 'ban';
 type ModerationDuration = '1h' | '24h' | '7d' | '30d' | 'permanent';
 
-type AdminLocation = Pick<Location, 'id' | 'name' | 'created_at'> & { created_by?: string };
+type AdminLocation = Pick<Location, 'id' | 'name' | 'created_at' | 'is_public'> & {
+  created_by?: string;
+  creator?: { username?: string | null; full_name?: string | null } | null;
+};
 type AdminCatch = Pick<Catch, 'id' | 'fish_species' | 'weight_kg' | 'caught_at' | 'user_id'> & {
   profiles?: { username?: string } | null;
   locations?: { name?: string } | null;
@@ -122,7 +125,7 @@ export default function ProfileScreen() {
   const [adminGroups, setAdminGroups] = useState<AdminGroup[]>([]);
   const [adminMessages, setAdminMessages] = useState<AdminMessage[]>([]);
   const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
-  const [adminUserSearch, setAdminUserSearch] = useState('');
+  const [adminSearch, setAdminSearch] = useState('');
   const [updatingAdminRoleId, setUpdatingAdminRoleId] = useState<string | null>(null);
   const [adminAnnouncement, setAdminAnnouncement] = useState<AdminAnnouncement | null>(null);
   const [announcementTitleRo, setAnnouncementTitleRo] = useState('');
@@ -197,18 +200,22 @@ export default function ProfileScreen() {
 
     setAdminLoading(true);
 
-    const locationsQuery = supabase.from('locations').select('id, name, created_at, created_by').order('created_at', { ascending: false }).limit(10);
+    const locationsQuery = supabase
+      .from('locations')
+      .select('id, name, created_at, created_by, is_public, creator:profiles!locations_created_by_fkey(username, full_name)')
+      .order('created_at', { ascending: false })
+      .limit(200);
     const catchesQuery = supabase
       .from('catches')
       .select('id, fish_species, weight_kg, caught_at, user_id, profiles:profiles!catches_user_id_fkey(username), locations:locations(name)')
       .order('caught_at', { ascending: false })
-      .limit(10);
-    const groupsQuery = supabase.from('groups').select('id, name, invite_code, created_at, owner_id').order('created_at', { ascending: false }).limit(10);
+      .limit(200);
+    const groupsQuery = supabase.from('groups').select('id, name, invite_code, created_at, owner_id').order('created_at', { ascending: false }).limit(200);
     const messagesQuery = supabase
       .from('messages')
       .select('id, content, created_at, user_id, profiles:profiles!messages_user_id_fkey(username)')
       .order('created_at', { ascending: false })
-      .limit(10);
+      .limit(200);
     const usersQuery = supabase
       .from('profiles')
       .select('id, username, full_name, role, created_at, muted_until, mute_permanent, banned_until, ban_permanent')
@@ -269,15 +276,69 @@ export default function ProfileScreen() {
     { key: 'permanent' as const, label: t('profile.moderationDurationPermanent'), ms: null },
   ], [t]);
 
+  const adminSearchTerm = adminSearch.trim().toLowerCase();
+
+  const filteredAdminLocations = useMemo(() => {
+    if (!adminSearchTerm) return adminLocations;
+    return adminLocations.filter((item) => {
+      const creatorUsername = item.creator?.username?.toLowerCase() ?? '';
+      const creatorFullName = item.creator?.full_name?.toLowerCase() ?? '';
+      const visibility = item.is_public ? t('profile.locationScopeGlobal').toLowerCase() : t('profile.locationScopePersonal').toLowerCase();
+      return item.name.toLowerCase().includes(adminSearchTerm)
+        || creatorUsername.includes(adminSearchTerm)
+        || creatorFullName.includes(adminSearchTerm)
+        || visibility.includes(adminSearchTerm);
+    });
+  }, [adminLocations, adminSearchTerm, t]);
+
+  const filteredAdminCatches = useMemo(() => {
+    if (!adminSearchTerm) return adminCatches;
+    return adminCatches.filter((item) => {
+      const species = item.fish_species?.toLowerCase() ?? '';
+      const username = item.profiles?.username?.toLowerCase() ?? '';
+      const locationName = item.locations?.name?.toLowerCase() ?? '';
+      const weight = String(item.weight_kg ?? '');
+      return species.includes(adminSearchTerm)
+        || username.includes(adminSearchTerm)
+        || locationName.includes(adminSearchTerm)
+        || weight.includes(adminSearchTerm);
+    });
+  }, [adminCatches, adminSearchTerm]);
+
+  const filteredAdminGroups = useMemo(() => {
+    if (!adminSearchTerm) return adminGroups;
+    return adminGroups.filter((item) => {
+      const inviteCode = item.invite_code?.toLowerCase() ?? '';
+      return item.name.toLowerCase().includes(adminSearchTerm) || inviteCode.includes(adminSearchTerm);
+    });
+  }, [adminGroups, adminSearchTerm]);
+
+  const filteredAdminMessages = useMemo(() => {
+    if (!adminSearchTerm) return adminMessages;
+    return adminMessages.filter((item) => {
+      const content = item.content?.toLowerCase() ?? '';
+      const username = item.profiles?.username?.toLowerCase() ?? '';
+      return content.includes(adminSearchTerm) || username.includes(adminSearchTerm);
+    });
+  }, [adminMessages, adminSearchTerm]);
+
   const filteredAdminUsers = useMemo(() => {
-    const term = adminUserSearch.trim().toLowerCase();
+    const term = adminSearchTerm;
     if (!term) return adminUsers;
     return adminUsers.filter((item) => {
       const username = item.username?.toLowerCase() ?? '';
       const fullName = item.full_name?.toLowerCase() ?? '';
       return username.includes(term) || fullName.includes(term);
     });
-  }, [adminUserSearch, adminUsers]);
+  }, [adminSearchTerm, adminUsers]);
+
+  const adminSearchPlaceholder = useMemo(() => {
+    if (activeAdminTab === 'locations') return t('profile.searchLocationsPlaceholder');
+    if (activeAdminTab === 'catches') return t('profile.searchCatchesPlaceholder');
+    if (activeAdminTab === 'groups') return t('profile.searchGroupsPlaceholder');
+    if (activeAdminTab === 'messages') return t('profile.searchMessagesPlaceholder');
+    return t('profile.searchUsersPlaceholder');
+  }, [activeAdminTab, t]);
 
   const isModerationActive = (item: AdminUser, kind: ModerationKind) => {
     const permanent = kind === 'mute' ? item.mute_permanent : item.ban_permanent;
@@ -879,24 +940,39 @@ export default function ProfileScreen() {
               ))}
             </ScrollView>
 
+            <TextInput
+              style={[styles.input, styles.adminSearchInput, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+              placeholder={adminSearchPlaceholder}
+              placeholderTextColor={theme.textSoft}
+              value={adminSearch}
+              onChangeText={setAdminSearch}
+              autoCapitalize="none"
+            />
+
             {adminLoading ? (
               <View style={styles.loadingBox}>
                 <ActivityIndicator color="#1D9E75" />
               </View>
             ) : (
               <>
-                {activeAdminTab === 'locations' && adminLocations.map((item) => (
+                {activeAdminTab === 'locations' && filteredAdminLocations.map((item) => (
                   <AdminRow
                     key={item.id}
                     title={item.name}
-                    subtitle={t('profile.createdOn', { date: formatDate(language, item.created_at) })}
+                    subtitle={[
+                      item.is_public ? t('profile.locationScopeGlobal') : t('profile.locationScopePersonal'),
+                      !item.is_public && isAdmin
+                        ? t('profile.locationCreatedBy', { username: item.creator?.username ?? item.creator?.full_name ?? t('profile.unknownUser') })
+                        : null,
+                      t('profile.createdOn', { date: formatDate(language, item.created_at) }),
+                    ].filter(Boolean).join(' · ')}
                     onDelete={() => handleDelete('locations', item.id, t('profile.deleteLocationLabel', { name: item.name }))}
                     theme={theme}
                     deleteLabel={t('common.delete')}
                   />
                 ))}
 
-                {activeAdminTab === 'catches' && adminCatches.map((item) => (
+                {activeAdminTab === 'catches' && filteredAdminCatches.map((item) => (
                   <AdminRow
                     key={item.id}
                     title={`${item.fish_species ?? t('profile.catchWithoutSpecies')}${item.weight_kg ? ` · ${item.weight_kg} kg` : ''}`}
@@ -907,7 +983,7 @@ export default function ProfileScreen() {
                   />
                 ))}
 
-                {activeAdminTab === 'groups' && adminGroups.map((item) => (
+                {activeAdminTab === 'groups' && filteredAdminGroups.map((item) => (
                   <AdminRow
                     key={item.id}
                     title={item.name}
@@ -918,7 +994,7 @@ export default function ProfileScreen() {
                   />
                 ))}
 
-                {activeAdminTab === 'messages' && adminMessages.map((item) => (
+                {activeAdminTab === 'messages' && filteredAdminMessages.map((item) => (
                   <AdminRow
                     key={item.id}
                     title={item.content?.trim() || t('profile.messageWithoutContent')}
@@ -930,19 +1006,13 @@ export default function ProfileScreen() {
                 ))}
 
                 {activeAdminTab === 'locations' && adminLocations.length === 0 && <EmptyAdminState label={isAdmin ? t('profile.noLocationsToModerate') : t('profile.noLocationsYet')} theme={theme} />}
+                {activeAdminTab === 'locations' && adminLocations.length > 0 && filteredAdminLocations.length === 0 && <EmptyAdminState label={t('profile.noLocationsMatch')} theme={theme} />}
                 {activeAdminTab === 'catches' && adminCatches.length === 0 && <EmptyAdminState label={isAdmin ? t('profile.noCatchesToModerate') : t('profile.noCatchesYet')} theme={theme} />}
+                {activeAdminTab === 'catches' && adminCatches.length > 0 && filteredAdminCatches.length === 0 && <EmptyAdminState label={t('profile.noCatchesMatch')} theme={theme} />}
                 {activeAdminTab === 'groups' && adminGroups.length === 0 && <EmptyAdminState label={isAdmin ? t('profile.noGroupsToModerate') : t('profile.noGroupsYet')} theme={theme} />}
+                {activeAdminTab === 'groups' && adminGroups.length > 0 && filteredAdminGroups.length === 0 && <EmptyAdminState label={t('profile.noGroupsMatch')} theme={theme} />}
                 {activeAdminTab === 'messages' && adminMessages.length === 0 && <EmptyAdminState label={isAdmin ? t('profile.noMessagesToModerate') : t('profile.noMessagesYet')} theme={theme} />}
-                {activeAdminTab === 'users' && (
-                  <TextInput
-                    style={[styles.input, styles.adminSearchInput, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
-                    placeholder={t('profile.searchUsersPlaceholder')}
-                    placeholderTextColor={theme.textSoft}
-                    value={adminUserSearch}
-                    onChangeText={setAdminUserSearch}
-                    autoCapitalize="none"
-                  />
-                )}
+                {activeAdminTab === 'messages' && adminMessages.length > 0 && filteredAdminMessages.length === 0 && <EmptyAdminState label={t('profile.noMessagesMatch')} theme={theme} />}
                 {activeAdminTab === 'users' && filteredAdminUsers.map((item) => (
                   <View key={item.id} style={[styles.adminRow, { borderTopColor: theme.borderSoft }]}> 
                     <View style={{ flex: 1 }}>
